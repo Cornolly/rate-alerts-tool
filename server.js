@@ -43,6 +43,7 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_status ON rate_monitors(status);
   `;
   
+  
   try {
     await pool.query(createTableQuery);
     console.log('Database initialized successfully');
