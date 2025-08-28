@@ -1,0 +1,20 @@
+{
+  "name": "rate-alerts-tool",
+  "version": "1.0.0",
+  "description": "Currency rate monitoring system with WhatsApp alerts and CRM integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.0",
+    "node-cron": "^3.0.2",
+    "axios": "^1.4.0",
+    "dotenv": "^16.1.4"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
