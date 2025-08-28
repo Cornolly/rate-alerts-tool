@@ -30,10 +30,12 @@ async function initializeDatabase() {
       target_client_rate DECIMAL(10,6) NOT NULL,
       target_market_rate DECIMAL(10,6) NOT NULL,
       alert_or_order VARCHAR(10) NOT NULL CHECK (alert_or_order IN ('alert', 'order')),
+      trigger_direction VARCHAR(10) DEFAULT 'above' CHECK (trigger_direction IN ('above', 'below')),
       status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'triggered', 'cancelled')),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       triggered_at TIMESTAMP,
       current_rate DECIMAL(10,6),
+      initial_rate DECIMAL(10,6),
       last_checked TIMESTAMP
     );
     
@@ -233,8 +235,13 @@ async function checkRates() {
         [currentRate, monitor.id]
       );
       
-      // Check if target rate is met
-      const targetMet = currentRate <= monitor.target_market_rate;
+      // Check if target rate is met based on direction
+      let targetMet = false;
+      if (monitor.trigger_direction === 'above') {
+        targetMet = currentRate >= monitor.target_market_rate;
+      } else {
+        targetMet = currentRate <= monitor.target_market_rate;
+      }
       
       if (targetMet) {
         console.log(`Target met for monitor ${monitor.id}: ${currentRate} <= ${monitor.target_market_rate}`);
@@ -332,17 +339,29 @@ app.post('/api/monitors', async (req, res) => {
     buyAmount,
     targetClientRate,
     targetMarketRate,
-    alertOrOrder
+    alertOrOrder,
+    triggerDirection
   } = req.body;
   
   try {
+    // Get current rate to store as initial rate for reference
+    const currentRate = await rateService.getRate(sellCurrency, buyCurrency);
+    
+    // Auto-determine direction if not specified
+    let direction = triggerDirection;
+    if (!direction) {
+      // If target is higher than current rate, assume they want it to go "above"
+      // If target is lower than current rate, assume they want it to go "below"
+      direction = targetMarketRate > currentRate ? 'above' : 'below';
+    }
+    
     const result = await pool.query(
       `INSERT INTO rate_monitors 
        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
-        target_client_rate, target_market_rate, alert_or_order)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+        target_client_rate, target_market_rate, alert_or_order, trigger_direction, initial_rate, current_rate)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *`,
       [pdId, sellCurrency, buyCurrency, sellAmount, buyAmount, 
-       targetClientRate, targetMarketRate, alertOrOrder]
+       targetClientRate, targetMarketRate, alertOrOrder, direction, currentRate]
     );
     
     res.status(201).json(result.rows[0]);
