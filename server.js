@@ -43,7 +43,6 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_status ON rate_monitors(status);
   `;
   
-  
   try {
     await pool.query(createTableQuery);
     console.log('Database initialized successfully');
@@ -429,11 +428,62 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Schedule automatic rate checks every 15 minutes
-cron.schedule('*/15 * * * *', () => {
-  console.log('Scheduled rate check triggered');
-  checkRates();
-});
+// Dynamic scheduling based on proximity to targets
+let currentCronJob = null;
+
+function scheduleNextCheck() {
+  // Cancel existing job if any
+  if (currentCronJob) {
+    currentCronJob.destroy();
+  }
+  
+  // Determine if we need frequent checks (every 1 minute vs every 15 minutes)
+  pool.query('SELECT * FROM rate_monitors WHERE status = $1', ['active'])
+    .then(result => {
+      let needsFrequentCheck = false;
+      
+      for (const monitor of result.rows) {
+        if (monitor.current_rate) {
+          const proximityPercent = Math.abs(monitor.current_rate - monitor.target_market_rate) / monitor.target_market_rate;
+          if (proximityPercent <= 0.002) { // Within 0.2%
+            needsFrequentCheck = true;
+            break;
+          }
+        }
+      }
+      
+      if (needsFrequentCheck) {
+        console.log('Close to targets detected - switching to 1-minute checks');
+        currentCronJob = cron.schedule('* * * * *', () => {
+          console.log('High-frequency rate check triggered');
+          checkRatesAndReschedule();
+        });
+      } else {
+        console.log('Normal monitoring - using 15-minute checks');
+        currentCronJob = cron.schedule('*/15 * * * *', () => {
+          console.log('Standard rate check triggered');
+          checkRatesAndReschedule();
+        });
+      }
+    })
+    .catch(err => {
+      console.error('Error determining check frequency:', err);
+      // Fallback to 15-minute checks
+      currentCronJob = cron.schedule('*/15 * * * *', () => {
+        console.log('Fallback rate check triggered');
+        checkRatesAndReschedule();
+      });
+    });
+}
+
+async function checkRatesAndReschedule() {
+  await checkRates();
+  // Reschedule based on new conditions after rate check
+  scheduleNextCheck();
+}
+
+// Initialize scheduling
+scheduleNextCheck();
 
 // Initialize and start server
 async function start() {
