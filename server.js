@@ -476,6 +476,7 @@ function scheduleNextCheck() {
     });
 }
 
+
 async function checkRatesAndReschedule() {
   await checkRates();
   // Reschedule based on new conditions after rate check
