@@ -434,7 +434,7 @@ let currentCronJob = null;
 function scheduleNextCheck() {
   // Cancel existing job if any
   if (currentCronJob) {
-    currentCronJob.destroy();
+    currentCronJob.stop();
   }
   
   // Determine if we need frequent checks (every 1 minute vs every 15 minutes)
@@ -475,7 +475,6 @@ function scheduleNextCheck() {
       });
     });
 }
-
 
 async function checkRatesAndReschedule() {
   await checkRates();
