@@ -615,12 +615,13 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
             index: "0",
             parameters: [
               {
-                type: "action",
-                action: {
-                  flow_action: "navigate",                 // open a specific screen
+                type: "payload",
+                payload: {
+                  flow_message_version: "3",        // required
+                  flow_token: process.env.WA_FLOW_TOKEN, // any opaque string you set
                   flow_id: process.env.WA_FLOW_ID,         // <-- set this (from Flows, not template id)
                   flow_cta: "Create rate alert",           // <-- must exactly match button text in template
-                  flow_token: process.env.WA_FLOW_TOKEN || "opaque-token",
+                  flow_action: "navigate",          // or "data_exchange" depending on your Flow
                   flow_action_payload: {
                     screen: "Rate alert"                   // <-- matches your pre-defined screen name
                   }
