@@ -572,31 +572,7 @@ app.get('/webhook/whatsapp', (req, res) => {
   }
 });
 
-// Test endpoint to list available templates
-app.get('/api/list-templates', async (req, res) => {
-  try {
-    const response = await axios.get(
-      `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/message_templates`,
-      {
-        headers: {
-          'Authorization': `Bearer ${process.env.WHATSAPP_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    console.log('Available templates:', JSON.stringify(response.data, null, 2));
-    res.json(response.data);
-  } catch (error) {
-    console.error('Error fetching templates:', error.response?.data);
-    res.status(500).json({ 
-      error: 'Failed to fetch templates',
-      details: error.response?.data
-    });
-  }
-});
-
-// Test endpoint to send rate_alert template with minimal structure
+// Test endpoint to send rate_alert template with correct format
 app.post('/api/test-template/:phoneNumber', async (req, res) => {
   try {
     const phoneNumber = req.params.phoneNumber;
@@ -604,7 +580,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     console.log('=== TESTING TEMPLATE SEND ===');
     console.log('Phone number:', phoneNumber);
     
-    // Try the absolute minimal template format
+    // Your template has static content - no dynamic parameters needed
     const payload = {
       messaging_product: "whatsapp",
       to: phoneNumber,
@@ -612,10 +588,11 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
       template: {
         name: "rate_alert",
         language: { code: "en" }
+        // No components needed - everything is static in your template
       }
     };
     
-    console.log('Sending minimal template payload:', JSON.stringify(payload, null, 2));
+    console.log('Sending template payload:', JSON.stringify(payload, null, 2));
     
     const response = await axios.post(
       `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
