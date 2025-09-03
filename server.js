@@ -176,16 +176,23 @@ class WhatsAppService {
         });
       }
       
+      // If no components, send template without components array
       const payload = {
         messaging_product: "whatsapp",
         to: phoneNumber,
         type: "template",
         template: {
           name: templateName,
-          language: { code: "en" },
-          components: components
+          language: { code: "en" }
         }
       };
+      
+      // Only add components if we have any
+      if (components.length > 0) {
+        payload.template.components = components;
+      }
+      
+      console.log('Sending template payload:', JSON.stringify(payload, null, 2));
       
       const response = await axios.post(
         `${this.baseURL}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
@@ -572,17 +579,12 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     
     console.log('=== TESTING TEMPLATE SEND ===');
     console.log('Phone number:', phoneNumber);
-    console.log('WhatsApp API Key exists:', !!process.env.WHATSAPP_API_KEY);
-    console.log('WhatsApp Phone Number ID:', process.env.WHATSAPP_PHONE_NUMBER_ID);
     
-    // Send your rate_alert template with required image header
-    const headerImageUrl = "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png";
-    
+    // First try sending the template without any parameters to see the base format
     const response = await whatsappService.sendTemplateMessage(
       phoneNumber, 
       'rate_alert', 
-      [], // Empty parameters - adjust if your template needs body parameters
-      headerImageUrl
+      [] // No parameters first
     );
     
     console.log('Template sent successfully:', response);
@@ -592,10 +594,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     });
   } catch (error) {
     console.error('=== TEMPLATE SEND ERROR ===');
-    console.error('Error object:', error);
-    console.error('Error response data:', error.response?.data);
-    console.error('Error status:', error.response?.status);
-    console.error('Error headers:', error.response?.headers);
+    console.error('Error response data:', JSON.stringify(error.response?.data, null, 2));
     
     res.status(500).json({ 
       error: 'Failed to send template',
