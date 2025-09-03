@@ -151,8 +151,31 @@ class WhatsAppService {
     }
   }
   
-  async sendTemplateMessage(phoneNumber, templateName, parameters) {
+  async sendTemplateMessage(phoneNumber, templateName, parameters, headerImage = null) {
     try {
+      const components = [];
+      
+      // Add header component if image is provided
+      if (headerImage) {
+        components.push({
+          type: "header",
+          parameters: [{
+            type: "image",
+            image: {
+              link: headerImage
+            }
+          }]
+        });
+      }
+      
+      // Add body component if parameters are provided
+      if (parameters && parameters.length > 0) {
+        components.push({
+          type: "body",
+          parameters: parameters.map(param => ({ type: "text", text: param }))
+        });
+      }
+      
       const payload = {
         messaging_product: "whatsapp",
         to: phoneNumber,
@@ -160,10 +183,7 @@ class WhatsAppService {
         template: {
           name: templateName,
           language: { code: "en" },
-          components: [{
-            type: "body",
-            parameters: parameters.map(param => ({ type: "text", text: param }))
-          }]
+          components: components
         }
       };
       
@@ -555,11 +575,14 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     console.log('WhatsApp API Key exists:', !!process.env.WHATSAPP_API_KEY);
     console.log('WhatsApp Phone Number ID:', process.env.WHATSAPP_PHONE_NUMBER_ID);
     
-    // Send your rate_alert template
+    // Send your rate_alert template with required image header
+    const headerImageUrl = "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png";
+    
     const response = await whatsappService.sendTemplateMessage(
       phoneNumber, 
       'rate_alert', 
-      [] // Empty parameters array - adjust if your template needs parameters
+      [], // Empty parameters - adjust if your template needs body parameters
+      headerImageUrl
     );
     
     console.log('Template sent successfully:', response);
