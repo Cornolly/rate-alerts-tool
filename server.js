@@ -156,13 +156,14 @@ class WhatsAppService {
       const components = [];
       
       // Add header component if image is provided
-      if (headerImage) {
+      const headerImageUrl = headerImage || process.env.RATE_ALERT_HEADER_IMAGE;
+      if (headerImageUrl) {
         components.push({
           type: "header",
           parameters: [{
             type: "image",
             image: {
-              link: headerImage
+              link: headerImageUrl
             }
           }]
         });
@@ -170,13 +171,16 @@ class WhatsAppService {
       
       // Add body component if parameters are provided
       if (parameters && parameters.length > 0) {
+        const body_parameters = parameters.map(param => 
+          typeof param === 'object' ? param : { type: "text", text: param }
+        );
+        
         components.push({
           type: "body",
-          parameters: parameters.map(param => ({ type: "text", text: param }))
+          parameters: body_parameters
         });
       }
       
-      // If no components, send template without components array
       const payload = {
         messaging_product: "whatsapp",
         to: phoneNumber,
@@ -580,15 +584,27 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     console.log('=== TESTING TEMPLATE SEND ===');
     console.log('Phone number:', phoneNumber);
     
-    // Your template has static content - no dynamic parameters needed
+    // Your template has a dynamic IMAGE parameter in the header
     const payload = {
       messaging_product: "whatsapp",
       to: phoneNumber,
       type: "template",
       template: {
         name: "rate_alert",
-        language: { code: "en" }
-        // No components needed - everything is static in your template
+        language: { code: "en" },
+        components: [
+          {
+            type: "header",
+            parameters: [
+              {
+                type: "image",
+                image: {
+                  link: process.env.RATE_ALERT_HEADER_IMAGE || "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png"
+                }
+              }
+            ]
+          }
+        ]
       }
     };
     
