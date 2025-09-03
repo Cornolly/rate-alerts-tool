@@ -127,6 +127,30 @@ class WhatsAppService {
     this.baseURL = process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/';
   }
   
+  async sendMessage(phoneNumber, messageData) {
+    try {
+      const response = await axios.post(
+        `${this.baseURL}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+        {
+          messaging_product: "whatsapp",
+          to: phoneNumber,
+          ...messageData
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      return response.data;
+    } catch (error) {
+      console.error('WhatsApp message error:', error);
+      throw error;
+    }
+  }
+  
   async sendTemplateMessage(phoneNumber, templateName, parameters) {
     try {
       const payload = {
@@ -156,7 +180,7 @@ class WhatsAppService {
       
       return response.data;
     } catch (error) {
-      console.error('WhatsApp message error:', error);
+      console.error('WhatsApp template message error:', error);
       throw error;
     }
   }
@@ -206,6 +230,74 @@ class PipelineService {
 
 const rateService = new RateService();
 const whatsappService = new WhatsAppService();
+// PipeDrive integration service
+class PipeDriveService {
+  constructor() {
+    this.apiKey = process.env.PIPEDRIVE_API_KEY;
+    this.baseURL = process.env.PIPEDRIVE_BASE_URL || 'https://api.pipedrive.com/v1';
+  }
+  
+  async getPersonById(personId) {
+    try {
+      const response = await axios.get(
+        `${this.baseURL}/persons/${personId}?api_token=${this.apiKey}`
+      );
+      return response.data.data;
+    } catch (error) {
+      console.error(`Error fetching person ${personId}:`, error);
+      return null;
+    }
+  }
+  
+  async getPersonMargin(personId) {
+    try {
+      const person = await this.getPersonById(personId);
+      if (!person) return null;
+      
+      // Look for margin in custom fields using the actual API key
+      const marginValue = person['d12fb97c7cf4908a8e57c8693aa187e64302413f'] || 
+                         person['margin'] || 
+                         0.5; // Default 0.5% margin if not found
+      
+      // Convert percentage to decimal (0.5 -> 0.005)
+      return parseFloat(marginValue) / 100;
+    } catch (error) {
+      console.error(`Error fetching margin for person ${personId}:`, error);
+      return 0.005; // Default 0.5% margin as decimal
+    }
+  }
+  
+  async searchPersonByPhone(phoneNumber) {
+    try {
+      // Clean phone number (remove + and spaces)
+      const cleanPhone = phoneNumber.replace(/[\+\s\-\(\)]/g, '');
+      
+      const response = await axios.get(
+        `${this.baseURL}/persons/search?term=${cleanPhone}&api_token=${this.apiKey}`
+      );
+      
+      if (response.data.data && response.data.data.items.length > 0) {
+        return response.data.data.items[0].item;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error(`Error searching person by phone ${phoneNumber}:`, error);
+      return null;
+    }
+  }
+}
+
+// Get current rate for a currency pair
+app.get('/api/rate/:from/:to', async (req, res) => {
+  try {
+    const rate = await rateService.getRate(req.params.from, req.params.to);
+    res.json({ rate });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const pipelineService = new PipelineService();
 
 // Core monitoring function
@@ -413,15 +505,358 @@ app.post('/api/check-rates', async (req, res) => {
   }
 });
 
-// Get current rate for a currency pair
-app.get('/api/rate/:from/:to', async (req, res) => {
+// WhatsApp webhook handler for incoming messages
+app.post('/webhook/whatsapp', express.raw({type: 'application/json'}), async (req, res) => {
   try {
-    const rate = await rateService.getRate(req.params.from, req.params.to);
-    res.json({ rate });
+    const body = JSON.parse(req.body);
+    
+    // Verify webhook (WhatsApp security)
+    if (body.object === 'whatsapp_business_account') {
+      body.entry?.forEach(entry => {
+        entry.changes?.forEach(change => {
+          if (change.field === 'messages') {
+            const message = change.value.messages?.[0];
+            if (message) {
+              handleIncomingMessage(message, change.value);
+            }
+          }
+        });
+      });
+    }
+    
+    res.status(200).send('OK');
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('WhatsApp webhook error:', error);
+    res.status(400).send('Error processing webhook');
   }
 });
+
+// WhatsApp webhook verification (required by Meta)
+app.get('/webhook/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  
+  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+    console.log('WhatsApp webhook verified');
+    res.status(200).send(challenge);
+  } else {
+    res.status(403).send('Forbidden');
+  }
+});
+
+// Test endpoint to send rate_alert template
+app.post('/api/test-template/:phoneNumber', async (req, res) => {
+  try {
+    const phoneNumber = req.params.phoneNumber;
+    
+    // Send your rate_alert template
+    const response = await whatsappService.sendTemplateMessage(
+      phoneNumber, 
+      'rate_alert', 
+      [] // Add any required parameters if your template needs them
+    );
+    
+    res.json({ 
+      message: 'Template sent successfully', 
+      whatsapp_response: response 
+    });
+  } catch (error) {
+    console.error('Error sending test template:', error);
+    res.status(500).json({ 
+      error: 'Failed to send template',
+      details: error.message 
+    });
+  }
+});
+
+// Enhanced webhook logging to capture template responses
+async function handleIncomingMessage(message, messageData) {
+  console.log('=== INCOMING WHATSAPP MESSAGE ===');
+  console.log('Message ID:', message.id);
+  console.log('Message Type:', message.type);
+  console.log('Full message object:', JSON.stringify(message, null, 2));
+  console.log('Full messageData object:', JSON.stringify(messageData, null, 2));
+  console.log('=== END MESSAGE LOG ===');
+  
+  try {
+    const phoneNumber = message.from;
+    const messageType = message.type;
+    
+    // Handle interactive message responses (from template buttons/lists)
+    if (messageType === 'interactive') {
+      await handleInteractiveMessage(message, phoneNumber);
+    }
+    // Handle text messages
+    else if (messageType === 'text') {
+      await handleTextMessage(message, phoneNumber);
+    }
+    // Handle template responses (when user responds to your rate_alert template)
+    else if (messageType === 'button' || messageType === 'list_reply') {
+      // Check if this is a response to the rate_alert template
+      const context = messageData.context;
+      if (context && context.from === process.env.WHATSAPP_PHONE_NUMBER_ID) {
+        await handleTemplateResponse(message, phoneNumber);
+      }
+    }
+  } catch (error) {
+    console.error('Error handling incoming message:', error);
+  }
+}
+
+async function handleTemplateResponse(message, phoneNumber) {
+  console.log('Handling template response for rate_alert');
+  
+  // Check if message contains structured data from your rate_alert template
+  // The exact structure depends on how your template is set up in Meta Business
+  
+  // If your template sends structured data, it might look like this:
+  const messageText = message.text?.body;
+  
+  // Parse the template response data
+  // You'll need to adjust this based on your actual template format
+  if (messageText && messageText.includes('rate_alert')) {
+    // Extract data from the template response
+    // This is a placeholder - adjust based on your actual template structure
+    await startRateAlertFlow(phoneNumber);
+  }
+}
+
+async function handleInteractiveMessage(message, phoneNumber) {
+  const interactive = message.interactive;
+  
+  // Handle template response for rate alert creation
+  if (interactive.type === 'button_reply') {
+    const buttonId = interactive.button_reply.id;
+    
+    if (buttonId === 'create_rate_alert') {
+      // Start rate alert creation flow
+      await startRateAlertFlow(phoneNumber);
+    }
+  }
+  
+  // Handle list responses (currency selection, frequency selection)
+  else if (interactive.type === 'list_reply') {
+    const listReply = interactive.list_reply;
+    await handleListSelection(phoneNumber, listReply);
+  }
+}
+
+async function handleTextMessage(message, phoneNumber) {
+  const text = message.text.body.toLowerCase().trim();
+  
+  // Handle target rate input
+  if (text.match(/^\d+\.?\d*$/)) {
+    await handleTargetRateInput(phoneNumber, parseFloat(text));
+  }
+}
+
+async function startRateAlertFlow(phoneNumber) {
+  // Send currency selection message
+  const currencyMessage = {
+    messaging_product: "whatsapp",
+    to: phoneNumber,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: "Create Rate Alert" },
+      body: { text: "Select the currency pair you want to monitor:" },
+      footer: { text: "Choose sell currency first" },
+      action: {
+        button: "Select Currency",
+        sections: [{
+          title: "Major Currencies",
+          rows: [
+            { id: "USD", title: "USD", description: "US Dollar" },
+            { id: "EUR", title: "EUR", description: "Euro" },
+            { id: "GBP", title: "GBP", description: "British Pound" },
+            { id: "JPY", title: "JPY", description: "Japanese Yen" },
+            { id: "CAD", title: "CAD", description: "Canadian Dollar" },
+            { id: "AUD", title: "AUD", description: "Australian Dollar" }
+          ]
+        }]
+      }
+    }
+  };
+  
+  await whatsappService.sendMessage(phoneNumber, currencyMessage);
+}
+
+// Store user flow state (in production, use Redis or database)
+const userFlowState = new Map();
+
+async function handleListSelection(phoneNumber, listReply) {
+  const selection = listReply.id;
+  const currentState = userFlowState.get(phoneNumber) || {};
+  
+  // Handle sell currency selection
+  if (!currentState.sellCurrency) {
+    currentState.sellCurrency = selection;
+    userFlowState.set(phoneNumber, currentState);
+    
+    // Send buy currency selection
+    await sendBuyCurrencySelection(phoneNumber, selection);
+  }
+  // Handle buy currency selection
+  else if (!currentState.buyCurrency) {
+    currentState.buyCurrency = selection;
+    userFlowState.set(phoneNumber, currentState);
+    
+    // Send frequency selection
+    await sendFrequencySelection(phoneNumber);
+  }
+  // Handle frequency selection
+  else if (!currentState.updateFrequency) {
+    currentState.updateFrequency = selection;
+    userFlowState.set(phoneNumber, currentState);
+    
+    // Request target rate
+    await requestTargetRate(phoneNumber, currentState);
+  }
+}
+
+async function sendBuyCurrencySelection(phoneNumber, sellCurrency) {
+  // Filter out the sell currency from buy options
+  const currencies = [
+    { id: "USD", title: "USD", description: "US Dollar" },
+    { id: "EUR", title: "EUR", description: "Euro" },
+    { id: "GBP", title: "GBP", description: "British Pound" },
+    { id: "JPY", title: "JPY", description: "Japanese Yen" },
+    { id: "CAD", title: "CAD", description: "Canadian Dollar" },
+    { id: "AUD", title: "AUD", description: "Australian Dollar" }
+  ].filter(curr => curr.id !== sellCurrency);
+  
+  const message = {
+    messaging_product: "whatsapp",
+    to: phoneNumber,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: "Select Buy Currency" },
+      body: { text: `You're selling ${sellCurrency}. What currency do you want to buy?` },
+      action: {
+        button: "Select Currency",
+        sections: [{
+          title: "Available Currencies",
+          rows: currencies
+        }]
+      }
+    }
+  };
+  
+  await whatsappService.sendMessage(phoneNumber, message);
+}
+
+async function sendFrequencySelection(phoneNumber) {
+  const message = {
+    messaging_product: "whatsapp",
+    to: phoneNumber,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: "Update Frequency" },
+      body: { text: "How often would you like updates about this rate?" },
+      action: {
+        button: "Select Frequency",
+        sections: [{
+          title: "Frequency Options",
+          rows: [
+            { id: "Daily", title: "Daily", description: "Get daily rate updates" },
+            { id: "Weekly", title: "Weekly", description: "Get weekly rate updates" },
+            { id: "Only when rate is achieved", title: "Target Only", description: "Only notify when target reached" }
+          ]
+        }]
+      }
+    }
+  };
+  
+  await whatsappService.sendMessage(phoneNumber, message);
+}
+
+async function requestTargetRate(phoneNumber, flowState) {
+  const message = {
+    messaging_product: "whatsapp",
+    to: phoneNumber,
+    type: "text",
+    text: {
+      body: `Perfect! You want to sell ${flowState.sellCurrency} for ${flowState.buyCurrency} with ${flowState.updateFrequency} updates.\n\nWhat's your target rate? (e.g., 1.25)`
+    }
+  };
+  
+  await whatsappService.sendMessage(phoneNumber, message);
+}
+
+async function handleTargetRateInput(phoneNumber, targetRate) {
+  const currentState = userFlowState.get(phoneNumber);
+  
+  if (!currentState || !currentState.sellCurrency || !currentState.buyCurrency) {
+    // User sent a number but we don't have their flow state
+    return;
+  }
+  
+  try {
+    // Find client in PipeDrive by phone number
+    const client = await pipeDriveService.searchPersonByPhone(phoneNumber);
+    if (!client) {
+      await whatsappService.sendMessage(phoneNumber, {
+        messaging_product: "whatsapp",
+        to: phoneNumber,
+        type: "text",
+        text: { body: "Sorry, I couldn't find your client record. Please contact support." }
+      });
+      return;
+    }
+    
+    // Get client margin from PipeDrive
+    const clientMargin = await pipeDriveService.getPersonMargin(client.id);
+    
+    // Calculate market rate (client rate minus margin)
+    const marketRate = targetRate * (1 - clientMargin);
+    
+    // Create the rate monitor
+    const monitor = await pool.query(
+      `INSERT INTO rate_monitors 
+       (pd_id, sell_currency, buy_currency, target_client_rate, target_market_rate, 
+        alert_or_order, update_frequency, trigger_direction, initial_rate, current_rate)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) RETURNING *`,
+      [
+        client.id.toString(),
+        currentState.sellCurrency,
+        currentState.buyCurrency,
+        targetRate,
+        marketRate,
+        'alert', // Default to alert
+        currentState.updateFrequency,
+        'above', // Will be determined by auto-detection logic
+        await rateService.getRate(currentState.sellCurrency, currentState.buyCurrency)
+      ]
+    );
+    
+    // Send confirmation message
+    await whatsappService.sendMessage(phoneNumber, {
+      messaging_product: "whatsapp",
+      to: phoneNumber,
+      type: "text",
+      text: {
+        body: `✅ Rate alert created successfully!\n\nCurrency: ${currentState.sellCurrency}/${currentState.buyCurrency}\nYour target rate: ${targetRate}\nMarket trigger rate: ${marketRate.toFixed(6)}\nUpdate frequency: ${currentState.updateFrequency}\n\nYou'll be notified when the rate reaches your target.`
+      }
+    });
+    
+    // Clear flow state
+    userFlowState.delete(phoneNumber);
+    
+    console.log('Rate monitor created via WhatsApp:', monitor.rows[0]);
+    
+  } catch (error) {
+    console.error('Error creating rate monitor:', error);
+    await whatsappService.sendMessage(phoneNumber, {
+      messaging_product: "whatsapp",
+      to: phoneNumber,
+      type: "text", 
+      text: { body: "Sorry, there was an error creating your alert. Please try again." }
+    });
+  }
+}
 
 // Health check
 app.get('/health', (req, res) => {
