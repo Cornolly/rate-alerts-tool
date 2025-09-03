@@ -396,7 +396,7 @@ async function handleAlert(monitor, currentRate) {
     
     await whatsappService.sendTemplateMessage(
       clientData.phone,
-      'rate_alert_template', // You'll need to create this template in WhatsApp Business
+      'rate_alert', // You'll need to create this template in WhatsApp Business
       [
         `${monitor.sell_currency}/${monitor.buy_currency}`,
         currentRate.toFixed(6),
@@ -585,21 +585,45 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     console.log('Phone number:', phoneNumber);
     
     // Your template has a dynamic IMAGE parameter in the header
+    // inside /api/test-template/:phoneNumber
     const payload = {
       messaging_product: "whatsapp",
-      to: phoneNumber,
+      to: phoneNumber,                 // e.g. "447873884142"
       type: "template",
       template: {
         name: "rate_alert",
-        language: { code: "en" },
+        language: { code: "en" },      // your template is English
         components: [
+          // Media header (your template uses an Image header)
           {
             type: "header",
             parameters: [
               {
                 type: "image",
                 image: {
-                  link: process.env.RATE_ALERT_HEADER_IMAGE || "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png"
+                  link:
+                    process.env.RATE_ALERT_HEADER_IMAGE ||
+                    "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png"
+                }
+              }
+            ]
+          },
+          // Flow button (required because the template CTA is "Complete Flow")
+          {
+            type: "button",
+            sub_type: "flow",
+            index: "0",
+            parameters: [
+              {
+                type: "action",
+                action: {
+                  flow_action: "navigate",                 // open a specific screen
+                  flow_id: process.env.WA_FLOW_ID,         // <-- set this (from Flows, not template id)
+                  flow_cta: "Create rate alert",           // <-- must exactly match button text in template
+                  flow_token: process.env.WA_FLOW_TOKEN || "opaque-token",
+                  flow_action_payload: {
+                    screen: "Rate alert"                   // <-- matches your pre-defined screen name
+                  }
                 }
               }
             ]
@@ -607,7 +631,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
         ]
       }
     };
-    
+
     console.log('Sending template payload:', JSON.stringify(payload, null, 2));
     
     const response = await axios.post(
