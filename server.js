@@ -616,7 +616,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
             parameters: [
               {
                 type: "payload",
-                payload: {
+                payload: JSON.stringify({
                   flow_message_version: "3",        // required
                   flow_token: process.env.WA_FLOW_TOKEN, // any opaque string you set
                   flow_id: process.env.WA_FLOW_ID,         // <-- set this (from Flows, not template id)
@@ -625,7 +625,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
                   flow_action_payload: {
                     screen: "Rate alert"                   // <-- matches your pre-defined screen name
                   }
-                }
+                })
               }
             ]
           }
