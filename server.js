@@ -580,17 +580,44 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     console.log('=== TESTING TEMPLATE SEND ===');
     console.log('Phone number:', phoneNumber);
     
-    // First try sending the template without any parameters to see the base format
-    const response = await whatsappService.sendTemplateMessage(
-      phoneNumber, 
-      'rate_alert', 
-      [] // No parameters first
+    // Your template expects an IMAGE parameter in the header
+    // Let's send it with the proper image parameter format
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phoneNumber,
+      type: "template",
+      template: {
+        name: "rate_alert",
+        language: { code: "en" },
+        components: [{
+          type: "header",
+          parameters: [{
+            type: "image",
+            image: {
+              link: process.env.RATE_ALERT_HEADER_IMAGE || "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png"
+            }
+          }]
+        }]
+      }
+    };
+    
+    console.log('Sending template payload:', JSON.stringify(payload, null, 2));
+    
+    const response = await axios.post(
+      `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      payload,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
     );
     
-    console.log('Template sent successfully:', response);
+    console.log('Template sent successfully:', response.data);
     res.json({ 
       message: 'Template sent successfully', 
-      whatsapp_response: response 
+      whatsapp_response: response.data 
     });
   } catch (error) {
     console.error('=== TEMPLATE SEND ERROR ===');
