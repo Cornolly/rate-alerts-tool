@@ -621,7 +621,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
                   flow_token: process.env.WA_FLOW_TOKEN, // any opaque string you set
                   flow_id: process.env.WA_FLOW_ID,         // <-- set this (from Flows, not template id)
                   flow_cta: "Create rate alert",           // <-- must exactly match button text in template
-                  flow_action: "navigate",          // or "data_exchange" depending on your Flow
+                  flow_action: "data_exchange",          // or "data_exchange" depending on your Flow
                   flow_action_payload: {
                     screen: "Rate alert"                   // <-- matches your pre-defined screen name
                   }
@@ -662,6 +662,69 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
     });
   }
 });
+
+
+async function handleIncomingMessage(message, messageData) {
+  console.log('=== INCOMING WHATSAPP MESSAGE ===');
+  console.log('Message Type:', message.type);
+
+  try {
+    // 1) Flow submission
+    if (message.type === 'interactive' && message.interactive?.nfm_reply) {
+      const nfm = message.interactive.nfm_reply;
+      const raw = nfm.response_json; // string
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch (e) {
+        console.error('Failed to parse flow response_json:', raw);
+      }
+
+      console.log('Flow name:', nfm.name);
+      console.log('Flow response:', data);
+
+      // TODO: map your field names from the Flow to DB columns
+      // Example (adjust to your Flow field keys):
+      const { sellCurrency, buyCurrency, updateFrequency, targetRate } = data;
+
+      // If you want to create the monitor right away:
+      if (sellCurrency && buyCurrency && targetRate) {
+        // look up person by phone, margin, etc. (reuse your existing functions)
+        const phoneNumber = message.from;
+
+        // Create the monitor using your existing logic...
+        // await createMonitorFromFlow(phoneNumber, sellCurrency, buyCurrency, updateFrequency, targetRate);
+
+        // Send confirmation back to the user
+        await whatsappService.sendMessage(phoneNumber, {
+          messaging_product: "whatsapp",
+          to: phoneNumber,
+          type: "text",
+          text: {
+            body:
+              `✅ Got it!\n` +
+              `Sell: ${sellCurrency}\nBuy: ${buyCurrency}\n` +
+              (updateFrequency ? `Frequency: ${updateFrequency}\n` : '') +
+              `Target: ${targetRate}`
+          }
+        });
+      }
+
+      return; // done
+    }
+
+    // 2) Existing handlers…
+    if (message.type === 'interactive') {
+      await handleInteractiveMessage(message, message.from);
+    } else if (message.type === 'text') {
+      await handleTextMessage(message, message.from);
+    }
+  } catch (err) {
+    console.error('Error handling incoming message:', err);
+  }
+}
+
+
 
 // Also add a simple test endpoint to verify WhatsApp connection
 app.post('/api/test-whatsapp-config', (req, res) => {
