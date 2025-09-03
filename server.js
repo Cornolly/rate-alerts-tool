@@ -550,24 +550,49 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
   try {
     const phoneNumber = req.params.phoneNumber;
     
+    console.log('=== TESTING TEMPLATE SEND ===');
+    console.log('Phone number:', phoneNumber);
+    console.log('WhatsApp API Key exists:', !!process.env.WHATSAPP_API_KEY);
+    console.log('WhatsApp Phone Number ID:', process.env.WHATSAPP_PHONE_NUMBER_ID);
+    
     // Send your rate_alert template
     const response = await whatsappService.sendTemplateMessage(
       phoneNumber, 
       'rate_alert', 
-      [] // Add any required parameters if your template needs them
+      [] // Empty parameters array - adjust if your template needs parameters
     );
     
+    console.log('Template sent successfully:', response);
     res.json({ 
       message: 'Template sent successfully', 
       whatsapp_response: response 
     });
   } catch (error) {
-    console.error('Error sending test template:', error);
+    console.error('=== TEMPLATE SEND ERROR ===');
+    console.error('Error object:', error);
+    console.error('Error response data:', error.response?.data);
+    console.error('Error status:', error.response?.status);
+    console.error('Error headers:', error.response?.headers);
+    
     res.status(500).json({ 
       error: 'Failed to send template',
-      details: error.message 
+      details: error.message,
+      whatsapp_error: error.response?.data
     });
   }
+});
+
+// Also add a simple test endpoint to verify WhatsApp connection
+app.post('/api/test-whatsapp-config', (req, res) => {
+  const config = {
+    hasApiKey: !!process.env.WHATSAPP_API_KEY,
+    hasPhoneNumberId: !!process.env.WHATSAPP_PHONE_NUMBER_ID,
+    hasVerifyToken: !!process.env.WHATSAPP_VERIFY_TOKEN,
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID ? 'Set' : 'Missing',
+    baseUrl: process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'
+  };
+  
+  res.json(config);
 });
 
 // Enhanced webhook logging to capture template responses
@@ -910,7 +935,6 @@ function scheduleNextCheck() {
       });
     });
 }
-
 
 async function checkRatesAndReschedule() {
   await checkRates();
