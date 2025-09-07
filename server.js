@@ -454,17 +454,25 @@ app.get('/api/monitors', async (req, res) => {
 
 // Create new monitor
 app.post('/api/monitors', async (req, res) => {
-  const {
-    pdId,
-    sellCurrency,
-    buyCurrency,
-    sellAmount,
-    buyAmount,
-    targetClientRate,
-    targetMarketRate,
-    alertOrOrder,
-    triggerDirection
-  } = req.body;
+  try {
+    const {
+      pdId,
+      sellCurrency,
+      buyCurrency,
+      sellAmount,
+      buyAmount,
+      targetClientRate,
+      targetMarketRate,
+      alertOrOrder,
+      triggerDirection,
+      // 👇 accept what Quote sends
+      updateFrequency,        // e.g. "daily" | "weekly" | "on_target"
+      updateFrequencyLabel,   // e.g. "Daily" | "Weekly" | "Only when rate is achieved"
+      phone
+    } = req.body || {};
+
+    // (optional) one-time debug so you can SEE what's arriving
+    console.log('MONITOR CREATE BODY:', JSON.stringify(req.body, null, 2));
   
   try {
     // Get current rate to store as initial rate for reference
@@ -638,6 +646,154 @@ app.post('/api/send-rate-alert-cta', async (req, res) => {
 });
 
 
+// CTA endpoint used by Quote to send the Flow-enabled rate_alert template
+app.post('/api/send-rate-alert-cta', async (req, res) => {
+  try {
+    if (req.headers['x-internal-secret'] !== process.env.INTERNAL_SHARED_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { phone } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+
+    const headerImage =
+      process.env.RATE_ALERT_HEADER_IMAGE ||
+      "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png";
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phone,
+      type: "template",
+      template: {
+        name: "rate_alert",
+        language: { code: "en" },
+        components: [
+          {
+            type: "header",
+            parameters: [{ type: "image", image: { link: headerImage } }]
+          },
+          {
+            type: "button",
+            sub_type: "flow",
+            index: "0",
+            parameters: [
+              {
+                type: "payload",
+                payload: JSON.stringify({
+                  flow_message_version: "3",
+                  flow_token: process.env.WA_FLOW_TOKEN,
+                  flow_id: process.env.WA_FLOW_ID,          // Flow ID from WA Flows
+                  flow_cta: "Create rate alert",             // must match your template button text
+                  flow_action: "data_exchange",
+                  flow_action_payload: { screen: "Rate alert" }
+                })
+              }
+            ]
+          }
+        ]
+      }
+    };
+
+    const resp = await axios.post(
+      `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v19.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      payload,
+      { headers: { Authorization: `Bearer ${process.env.WHATSAPP_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+
+    return res.json({ message_id: resp.data?.messages?.[0]?.id || null, raw: resp.data });
+  } catch (e) {
+    console.error('send-rate-alert-cta error', e.response?.data || e.message);
+    return res.status(500).json({ error: 'failed_to_send', details: e.response?.data || e.message });
+  }
+});
+
+
+// Test endpoint to send rate_alert template with correct format
+app.post('/api/test-template/:phoneNumber', async (req, res) => {
+  try {
+    const phoneNumber = req.params.phoneNumber;
+    
+    console.log('=== TESTING TEMPLATE SEND ===');
+    console.log('Phone number:', phoneNumber);
+    
+    // Your template has a dynamic IMAGE parameter in the header
+    // inside /api/test-template/:phoneNumber
+    const payload = {
+      messaging_product: "whatsapp",
+      to: phoneNumber,                 // e.g. "447873884142"
+      type: "template",
+      template: {
+        name: "rate_alert",
+        language: { code: "en" },      // your template is English
+        components: [
+          // Media header (your template uses an Image header)
+          {
+            type: "header",
+            parameters: [
+              {
+                type: "image",
+                image: {
+                  link:
+                    process.env.RATE_ALERT_HEADER_IMAGE ||
+                    "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png"
+                }
+              }
+            ]
+          },
+          // Flow button (required because the template CTA is "Complete Flow")
+          {
+            type: "button",
+            sub_type: "flow",
+            index: "0",
+            parameters: [
+              {
+                type: "payload",
+                payload: JSON.stringify({
+                  flow_message_version: "3",        // required
+                  flow_token: process.env.WA_FLOW_TOKEN, // any opaque string you set
+                  flow_id: process.env.WA_FLOW_ID,         // <-- set this (from Flows, not template id)
+                  flow_cta: "Create rate alert",           // <-- must exactly match button text in template
+                  flow_action: "data_exchange",          // or "data_exchange" depending on your Flow
+                  flow_action_payload: {
+                    screen: "Rate alert"                   // <-- matches your pre-defined screen name
+                  }
+                })
+              }
+            ]
+          }
+        ]
+      }
+    };
+
+    console.log('Sending template payload:', JSON.stringify(payload, null, 2));
+    
+    const response = await axios.post(
+      `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
+      payload,
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.WHATSAPP_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    console.log('Template sent successfully:', response.data);
+    res.json({ 
+      message: 'Template sent successfully', 
+      whatsapp_response: response.data 
+    });
+  } catch (error) {
+    console.error('=== TEMPLATE SEND ERROR ===');
+    console.error('Error response data:', JSON.stringify(error.response?.data, null, 2));
+    
+    res.status(500).json({ 
+      error: 'Failed to send template',
+      details: error.message,
+      whatsapp_error: error.response?.data
+    });
+  }
+});
 
 async function handleIncomingMessage(message, messageData) {
   console.log('=== INCOMING WHATSAPP MESSAGE ===');
