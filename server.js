@@ -271,10 +271,6 @@ class PipelineService {
   }
 }
 
-const rateService = new RateService();
-const whatsappService = new WhatsAppService();
-const pipeDriveService = new PipeDriveService();
-const pipelineService = new PipelineService();
 // PipeDrive integration service
 class PipeDriveService {
   constructor() {
@@ -332,6 +328,11 @@ class PipeDriveService {
     }
   }
 }
+
+const rateService = new RateService();
+const whatsappService = new WhatsAppService();
+const pipelineService = new PipelineService();
+const pipeDriveService = new PipeDriveService();
 
 // Get current rate for a currency pair
 app.get('/api/rate/:from/:to', async (req, res) => {
