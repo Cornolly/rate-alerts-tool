@@ -452,7 +452,6 @@ app.get('/api/monitors', async (req, res) => {
   }
 });
 
-// Create new monitor
 app.post('/api/monitors', async (req, res) => {
   try {
     const {
@@ -473,33 +472,50 @@ app.post('/api/monitors', async (req, res) => {
 
     // (optional) one-time debug so you can SEE what's arriving
     console.log('MONITOR CREATE BODY:', JSON.stringify(req.body, null, 2));
-  
-  try {
-    // Get current rate to store as initial rate for reference
+
+    // Get current rate to store as initial/current reference
     const currentRate = await rateService.getRate(sellCurrency, buyCurrency);
-    
-    // Auto-determine direction if not specified
+
+    // Auto direction if not provided
     let direction = triggerDirection;
     if (!direction) {
-      // If target is higher than current rate, assume they want it to go "above"
-      // If target is lower than current rate, assume they want it to go "below"
       direction = targetMarketRate > currentRate ? 'above' : 'below';
     }
-    
+
+    // Normalize frequency for DB (store human-readable)
+    const rawFreq = (updateFrequency || updateFrequencyLabel || '').toString().trim().toLowerCase();
+    let dbFreq = null; // keep null if nothing sent
+    if (rawFreq.startsWith('daily')) {
+      dbFreq = 'Daily';
+    } else if (rawFreq.startsWith('week')) {
+      dbFreq = 'Weekly';
+    } else if (rawFreq === 'on_target' || (rawFreq.includes('only') && rawFreq.includes('achiev'))) {
+      dbFreq = 'Only when rate is achieved';
+    }
+
     const result = await pool.query(
       `INSERT INTO rate_monitors 
        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
-        target_client_rate, target_market_rate, alert_or_order, trigger_direction, initial_rate, current_rate)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10) RETURNING *`,
-      [pdId, sellCurrency, buyCurrency, sellAmount, buyAmount, 
-       targetClientRate, targetMarketRate, alertOrOrder, direction, currentRate]
+        target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
+        initial_rate, current_rate, update_frequency, phone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12)
+       RETURNING *`,
+      [
+        pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
+        targetClientRate, targetMarketRate, alertOrOrder, direction,
+        currentRate,            // initial_rate
+        dbFreq,                 // update_frequency (may be null if not provided)
+        phone || null           // phone (optional)
+      ]
     );
-    
+
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    console.error('Create monitor error:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
