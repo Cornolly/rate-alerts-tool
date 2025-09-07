@@ -11,15 +11,17 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public'));
 
+// at top of server.js (once)
+const VERBOSE = process.env.VERBOSE_LOGS === '1';
+
 // Database connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Initialize database table
 async function initializeDatabase() {
-  const createTableQuery = `
+  const createTableAndIndexes = `
     CREATE TABLE IF NOT EXISTS rate_monitors (
       id SERIAL PRIMARY KEY,
       pd_id VARCHAR(255) NOT NULL,
@@ -38,18 +40,26 @@ async function initializeDatabase() {
       initial_rate DECIMAL(10,6),
       last_checked TIMESTAMP
     );
-    
+
     CREATE INDEX IF NOT EXISTS idx_currency_pair ON rate_monitors(sell_currency, buy_currency);
     CREATE INDEX IF NOT EXISTS idx_status ON rate_monitors(status);
   `;
-  
+
+  const alterTable = `
+    ALTER TABLE rate_monitors
+      ADD COLUMN IF NOT EXISTS update_frequency VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS phone VARCHAR(32);
+  `;
+
   try {
-    await pool.query(createTableQuery);
+    await pool.query(createTableAndIndexes);
+    await pool.query(alterTable);
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
   }
 }
+
 
 // Rate fetching service using OpenExchangeRates API
 class RateService {
@@ -196,7 +206,9 @@ class WhatsAppService {
         payload.template.components = components;
       }
       
-      console.log('Sending template payload:', JSON.stringify(payload, null, 2));
+      if (VERBOSE) {
+        console.log('Sending template payload:', JSON.stringify(payload, null, 2));
+      }
       
       const response = await axios.post(
         `${this.baseURL}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
@@ -261,6 +273,8 @@ class PipelineService {
 
 const rateService = new RateService();
 const whatsappService = new WhatsAppService();
+const pipeDriveService = new PipeDriveService();
+const pipelineService = new PipelineService();
 // PipeDrive integration service
 class PipeDriveService {
   constructor() {
@@ -328,8 +342,6 @@ app.get('/api/rate/:from/:to', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
-const pipelineService = new PipelineService();
 
 // Core monitoring function
 async function checkRates() {
@@ -476,8 +488,12 @@ app.post('/api/monitors', async (req, res) => {
       phone
     } = req.body || {};
 
-    // (optional) one-time debug so you can SEE what's arriving
-    console.log('MONITOR CREATE BODY:', JSON.stringify(req.body, null, 2));
+    // inside /api/monitors handler
+    if (VERBOSE) {
+      // avoid gigantic payloads
+      const pretty = JSON.stringify(req.body, null, 2);
+      console.log('MONITOR CREATE BODY:', pretty.length > 4000 ? pretty.slice(0, 4000) + ' …(truncated)' : pretty);
+    }
 
     // Get current rate to store as initial/current reference
     const currentRate = await rateService.getRate(sellCurrency, buyCurrency);
@@ -547,12 +563,12 @@ async function notifyQuoteTriggered(monitor, currentRate) {
       targetClientRate: Number(monitor.target_client_rate),
       currentClientRate: Number(currentRate)
     };
-    console.log('📤 POST to Quote', { url, payload });
+    if (VERBOSE) console.log('📤 POST to Quote', { url, payload });
 
     const r = await axios.post(url, payload, {
       headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET }
     });
-    console.log('✅ Quote responded', { status: r.status, data: r.data });
+    if (VERBOSE) console.log('✅ Quote responded', { status: r.status, data: r.data });
   } catch (e) {
     console.error('❌ notifyQuoteTriggered failed', {
       status: e.response?.status,
@@ -609,7 +625,7 @@ app.post('/api/check-rates', async (req, res) => {
 // WhatsApp webhook handler for incoming messages
 app.post('/webhook/whatsapp', express.raw({type: 'application/json'}), async (req, res) => {
   try {
-    const body = JSON.parse(req.body);
+    const body = JSON.parse(req.body.toString('utf8'));
     
     // Verify webhook (WhatsApp security)
     if (body.object === 'whatsapp_business_account') {
@@ -643,67 +659,6 @@ app.get('/webhook/whatsapp', (req, res) => {
     res.status(200).send(challenge);
   } else {
     res.status(403).send('Forbidden');
-  }
-});
-
-// Add near the other API routes. This section is the new additionn from ChatGPT
-app.post('/api/send-rate-alert-cta', async (req, res) => {
-  try {
-    if (req.headers['x-internal-secret'] !== process.env.INTERNAL_SHARED_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'phone required' });
-
-    const headerImage =
-      process.env.RATE_ALERT_HEADER_IMAGE ||
-      "https://raw.githubusercontent.com/Cornolly/summitfx-assets/main/Logo%20standard.png";
-
-    const payload = {
-      messaging_product: "whatsapp",
-      to: phone,
-      type: "template",
-      template: {
-        name: "rate_alert",
-        language: { code: "en" },
-        components: [
-          {
-            type: "header",
-            parameters: [{ type: "image", image: { link: headerImage } }]
-          },
-          {
-            type: "button",
-            sub_type: "flow",
-            index: "0",
-            parameters: [
-              {
-                type: "payload",
-                payload: JSON.stringify({
-                  flow_message_version: "3",
-                  flow_token: process.env.WA_FLOW_TOKEN,
-                  flow_id: process.env.WA_FLOW_ID,          // Flow ID from WA Flows
-                  flow_cta: "Create rate alert",             // must match template CTA text
-                  flow_action: "data_exchange",
-                  flow_action_payload: { screen: "Rate alert" }
-                })
-              }
-            ]
-          }
-        ]
-      }
-    };
-
-    const resp = await axios.post(
-      `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v19.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
-      payload,
-      { headers: { Authorization: `Bearer ${process.env.WHATSAPP_API_KEY}`, 'Content-Type': 'application/json' } }
-    );
-
-    return res.json({ message_id: resp.data?.messages?.[0]?.id || null, raw: resp.data });
-  } catch (e) {
-    console.error('send-rate-alert-cta error', e.response?.data || e.message);
-    return res.status(500).json({ error: 'failed_to_send', details: e.response?.data || e.message });
   }
 });
 
@@ -827,7 +782,13 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
       }
     };
 
-    console.log('Sending template payload:', JSON.stringify(payload, null, 2));
+    if (VERBOSE) {
+      const pretty = JSON.stringify(payload, null, 2);
+      console.log(
+        'Sending template payload:',
+        pretty.length > 2000 ? pretty.slice(0, 2000) + ' …(truncated)' : pretty
+      );
+    }
     
     const response = await axios.post(
       `${process.env.WHATSAPP_BASE_URL || 'https://graph.facebook.com/v17.0/'}${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
@@ -857,66 +818,6 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
   }
 });
 
-async function handleIncomingMessage(message, messageData) {
-  console.log('=== INCOMING WHATSAPP MESSAGE ===');
-  console.log('Message Type:', message.type);
-
-  try {
-    // 1) Flow submission
-    if (message.type === 'interactive' && message.interactive?.nfm_reply) {
-      const nfm = message.interactive.nfm_reply;
-      const raw = nfm.response_json; // string
-      let data = {};
-      try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch (e) {
-        console.error('Failed to parse flow response_json:', raw);
-      }
-
-      console.log('Flow name:', nfm.name);
-      console.log('Flow response:', data);
-
-      // TODO: map your field names from the Flow to DB columns
-      // Example (adjust to your Flow field keys):
-      const { sellCurrency, buyCurrency, updateFrequency, targetRate } = data;
-
-      // If you want to create the monitor right away:
-      if (sellCurrency && buyCurrency && targetRate) {
-        // look up person by phone, margin, etc. (reuse your existing functions)
-        const phoneNumber = message.from;
-
-        // Create the monitor using your existing logic...
-        // await createMonitorFromFlow(phoneNumber, sellCurrency, buyCurrency, updateFrequency, targetRate);
-
-        // Send confirmation back to the user
-        await whatsappService.sendMessage(phoneNumber, {
-          messaging_product: "whatsapp",
-          to: phoneNumber,
-          type: "text",
-          text: {
-            body:
-              `✅ Got it!\n` +
-              `Sell: ${sellCurrency}\nBuy: ${buyCurrency}\n` +
-              (updateFrequency ? `Frequency: ${updateFrequency}\n` : '') +
-              `Target: ${targetRate}`
-          }
-        });
-      }
-
-      return; // done
-    }
-
-    // 2) Existing handlers…
-    if (message.type === 'interactive') {
-      await handleInteractiveMessage(message, message.from);
-    } else if (message.type === 'text') {
-      await handleTextMessage(message, message.from);
-    }
-  } catch (err) {
-    console.error('Error handling incoming message:', err);
-  }
-}
-
 
 
 // Also add a simple test endpoint to verify WhatsApp connection
@@ -937,9 +838,12 @@ async function handleIncomingMessage(message, messageData) {
   console.log('=== INCOMING WHATSAPP MESSAGE ===');
   console.log('Message ID:', message.id);
   console.log('Message Type:', message.type);
-  console.log('Full message object:', JSON.stringify(message, null, 2));
-  console.log('Full messageData object:', JSON.stringify(messageData, null, 2));
+  if (VERBOSE) {
+    console.log('Full message object:', JSON.stringify(message, null, 2));
+    console.log('Full messageData object:', JSON.stringify(messageData, null, 2));
+  }
   console.log('=== END MESSAGE LOG ===');
+
   
   try {
     const phoneNumber = message.from;
@@ -1279,17 +1183,17 @@ async function checkRatesAndReschedule() {
   scheduleNextCheck();
 }
 
-// Initialize scheduling
-scheduleNextCheck();
 
 // Initialize and start server
 async function start() {
-  await initializeDatabase();
-  
+  await initializeDatabase();   // make sure tables/columns/indexes exist
+  scheduleNextCheck();          // now it's safe to start the cron logic
+  // (optional) run one immediate check:
+  // await checkRates();
+
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
     console.log(`Rate monitoring service running on port ${port}`);
-    console.log('Automated checks will run every 15 minutes');
   });
 }
 
