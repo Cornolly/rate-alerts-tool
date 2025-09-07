@@ -334,66 +334,66 @@ const pipelineService = new PipelineService();
 // Core monitoring function
 async function checkRates() {
   console.log('Starting rate check...', new Date().toISOString());
-  
+
   try {
-    const activeMonitors = await pool.query(
+    const { rows: monitors } = await pool.query(
       'SELECT * FROM rate_monitors WHERE status = $1',
       ['active']
     );
-    
-    for (const monitor of activeMonitors.rows) {
+
+    for (const monitor of monitors) {
       const currentRate = await rateService.getRate(
-        monitor.sell_currency, 
+        monitor.sell_currency,
         monitor.buy_currency
       );
-      
+
       if (!currentRate) {
         console.log(`Could not fetch rate for ${monitor.sell_currency}/${monitor.buy_currency}`);
         continue;
       }
-      
-      // Update current rate in database
+
+      // keep current snapshot fresh
       await pool.query(
         'UPDATE rate_monitors SET current_rate = $1, last_checked = CURRENT_TIMESTAMP WHERE id = $2',
         [currentRate, monitor.id]
       );
-      
-      // Check if target rate is met based on direction
-      let targetMet = false;
-      if (monitor.trigger_direction === 'above') {
-        targetMet = currentRate >= monitor.target_market_rate;
-      } else {
-        targetMet = currentRate <= monitor.target_market_rate;
+
+      const targetMet =
+        monitor.trigger_direction === 'above'
+          ? currentRate >= Number(monitor.target_market_rate)
+          : currentRate <= Number(monitor.target_market_rate);
+
+      if (!targetMet) continue;
+
+      console.log(`🎯 target met for monitor ${monitor.id} (mode=${monitor.alert_or_order})`);
+
+      // Atomically claim the row (prevents dup sends)
+      const claim = await pool.query(
+        `UPDATE rate_monitors
+           SET status = 'triggered', triggered_at = NOW()
+         WHERE id = $1 AND status = 'active'
+         RETURNING id`,
+        [monitor.id]
+      );
+
+      if (claim.rowCount === 0) {
+        console.log(`↪️ already handled monitor ${monitor.id}, skipping notify`);
+        continue;
       }
-      
-      if (targetMet) {
-        console.log(`🎯 target met for monitor ${monitor.id} (mode=${monitor.alert_or_order})`);
-        if (monitor.alert_or_order === 'alert') {
-          console.log('➡️ about to notify Quote', {
-            id: monitor.id,
-            phone: monitor.phone,
-            pair: `${monitor.sell_currency}/${monitor.buy_currency}`,
-            targetClientRate: Number(monitor.target_client_rate),
-            currentRate
-          });
-          await notifyQuoteTriggered(monitor, currentRate);
-        } else {
-          await handleOrder(monitor, currentRate);
-        }
-      
-        // Mark as triggered
-        await pool.query(
-          'UPDATE rate_monitors SET status = $1, triggered_at = CURRENT_TIMESTAMP WHERE id = $2',
-          ['triggered', monitor.id]
-        );
-      }      
+
+      if (monitor.alert_or_order === 'alert') {
+        await notifyQuoteTriggered(monitor, currentRate);
+      } else {
+        await handleOrder(monitor, currentRate);
+      }
     }
-    
+
     console.log('Rate check completed');
   } catch (error) {
     console.error('Rate check error:', error);
   }
 }
+
 
 async function handleAlert(monitor, currentRate) {
   try {
