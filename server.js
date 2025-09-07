@@ -367,11 +367,15 @@ async function checkRates() {
       }
       
       if (targetMet) {
-        console.log(`Target met for monitor ${monitor.id}: ${currentRate} vs target ${monitor.target_market_rate}`);
-      
+        console.log(`🎯 target met for monitor ${monitor.id} (mode=${monitor.alert_or_order})`);
         if (monitor.alert_or_order === 'alert') {
-          // ❌ Old: await handleAlert(monitor, currentRate);  // Rate-alerts sends the message
-          // ✅ New: tell Quote to send the template
+          console.log('➡️ about to notify Quote', {
+            id: monitor.id,
+            phone: monitor.phone,
+            pair: `${monitor.sell_currency}/${monitor.buy_currency}`,
+            targetClientRate: Number(monitor.target_client_rate),
+            currentRate
+          });
           await notifyQuoteTriggered(monitor, currentRate);
         } else {
           await handleOrder(monitor, currentRate);
@@ -522,24 +526,42 @@ app.post('/api/monitors', async (req, res) => {
 // tell Quote to send the "alert_triggerd" template
 async function notifyQuoteTriggered(monitor, currentRate) {
   try {
-    if (!process.env.QUOTE_BASE_URL) return; // no-op if not configured
-    await axios.post(
-      `${process.env.QUOTE_BASE_URL}/api/send-alert-triggered`,
-      {
-        phone: monitor.phone, // make sure you store this when creating the monitor (see step 2)
-        sellCurrency: monitor.sell_currency,
-        buyCurrency: monitor.buy_currency,
-        targetClientRate: Number(monitor.target_client_rate),
-        currentClientRate: Number(currentRate)
-      },
-      { headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET } }
-    );
-    console.log("✅ Notified Quote to send alert_triggerd template");
+    if (!process.env.QUOTE_BASE_URL) {
+      console.error('❌ QUOTE_BASE_URL not set');
+      return;
+    }
+    if (!process.env.INTERNAL_SHARED_SECRET) {
+      console.error('❌ INTERNAL_SHARED_SECRET not set');
+      return;
+    }
+    if (!monitor.phone) {
+      console.error('❌ monitor has no phone; cannot notify Quote', { id: monitor.id });
+      return;
+    }
+
+    const url = `${process.env.QUOTE_BASE_URL}/api/send-alert-triggered`;
+    const payload = {
+      phone: monitor.phone,
+      sellCurrency: monitor.sell_currency,
+      buyCurrency: monitor.buy_currency,
+      targetClientRate: Number(monitor.target_client_rate),
+      currentClientRate: Number(currentRate)
+    };
+    console.log('📤 POST to Quote', { url, payload });
+
+    const r = await axios.post(url, payload, {
+      headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET }
+    });
+    console.log('✅ Quote responded', { status: r.status, data: r.data });
   } catch (e) {
-    console.error("❌ notifyQuoteTriggered failed:",
-      e.response?.data || e.message);
+    console.error('❌ notifyQuoteTriggered failed', {
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message
+    });
   }
 }
+
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
