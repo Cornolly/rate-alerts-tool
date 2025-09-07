@@ -516,6 +516,18 @@ app.post('/api/monitors', async (req, res) => {
   }
 });
 
+// Node (in rate-alerts) when a monitor triggers:
+await axios.post(
+  process.env.RATE_ALERTS_BASE_FOR_QUOTE + "/api/send-alert-triggered",
+  {
+    phone: monitor.phone,                 // store phone when creating monitor
+    sellCurrency: monitor.sell_currency,
+    buyCurrency: monitor.buy_currency,
+    targetClientRate: Number(monitor.target_client_rate),
+    currentClientRate: Number(currentRate)
+  },
+  { headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET } }
+);
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
