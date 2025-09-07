@@ -367,20 +367,22 @@ async function checkRates() {
       }
       
       if (targetMet) {
-        console.log(`Target met for monitor ${monitor.id}: ${currentRate} <= ${monitor.target_market_rate}`);
-        
+        console.log(`Target met for monitor ${monitor.id}: ${currentRate} vs target ${monitor.target_market_rate}`);
+      
         if (monitor.alert_or_order === 'alert') {
-          await handleAlert(monitor, currentRate);
+          // ❌ Old: await handleAlert(monitor, currentRate);  // Rate-alerts sends the message
+          // ✅ New: tell Quote to send the template
+          await notifyQuoteTriggered(monitor, currentRate);
         } else {
           await handleOrder(monitor, currentRate);
         }
-        
+      
         // Mark as triggered
         await pool.query(
           'UPDATE rate_monitors SET status = $1, triggered_at = CURRENT_TIMESTAMP WHERE id = $2',
           ['triggered', monitor.id]
         );
-      }
+      }      
     }
     
     console.log('Rate check completed');
@@ -498,14 +500,15 @@ app.post('/api/monitors', async (req, res) => {
        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
         target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
         initial_rate, current_rate, update_frequency, phone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
         targetClientRate, targetMarketRate, alertOrOrder, direction,
-        currentRate,            // initial_rate
-        dbFreq,                 // update_frequency (may be null if not provided)
-        phone || null           // phone (optional)
+        currentRate,        // initial_rate
+        currentRate,        // current_rate (start equal to initial)
+        dbFreq,             // update_frequency
+        phone || null       // phone
       ]
     );
 
@@ -516,18 +519,27 @@ app.post('/api/monitors', async (req, res) => {
   }
 });
 
-// Node (in rate-alerts) when a monitor triggers:
-await axios.post(
-  process.env.RATE_ALERTS_BASE_FOR_QUOTE + "/api/send-alert-triggered",
-  {
-    phone: monitor.phone,                 // store phone when creating monitor
-    sellCurrency: monitor.sell_currency,
-    buyCurrency: monitor.buy_currency,
-    targetClientRate: Number(monitor.target_client_rate),
-    currentClientRate: Number(currentRate)
-  },
-  { headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET } }
-);
+// tell Quote to send the "alert_triggerd" template
+async function notifyQuoteTriggered(monitor, currentRate) {
+  try {
+    if (!process.env.QUOTE_BASE_URL) return; // no-op if not configured
+    await axios.post(
+      `${process.env.QUOTE_BASE_URL}/api/send-alert-triggered`,
+      {
+        phone: monitor.phone, // make sure you store this when creating the monitor (see step 2)
+        sellCurrency: monitor.sell_currency,
+        buyCurrency: monitor.buy_currency,
+        targetClientRate: Number(monitor.target_client_rate),
+        currentClientRate: Number(currentRate)
+      },
+      { headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET } }
+    );
+    console.log("✅ Notified Quote to send alert_triggerd template");
+  } catch (e) {
+    console.error("❌ notifyQuoteTriggered failed:",
+      e.response?.data || e.message);
+  }
+}
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
