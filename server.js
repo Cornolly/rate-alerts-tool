@@ -51,13 +51,39 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS phone VARCHAR(32);
   `;
 
+  // Enforce one active monitor per (pd_id, pair, phone)
+  const createPartialUnique = `
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_monitor
+    ON rate_monitors (pd_id, sell_currency, buy_currency, phone)
+    WHERE status = 'active';
+  `;
+
   try {
     await pool.query(createTableAndIndexes);
     await pool.query(alterTable);
+    await pool.query(createPartialUnique); // <-- add this line
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
   }
+}
+
+// Simple phone normalizer -> E.164-ish (best effort).
+function normalizePhone(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+
+  // keep digits and '+' only
+  const cleaned = raw.replace(/[^\d+]/g, '');
+
+  // already looks like +<digits> → use as-is
+  if (/^\+\d{6,}$/.test(cleaned)) return cleaned;
+
+  // otherwise prepend default country code if provided
+  const cc = (process.env.DEFAULT_COUNTRY_CODE || '').replace(/\D/g, '');
+  const digits = cleaned.replace(/\D/g, '').replace(/^0+/, ''); // strip non-digits and leading zeros
+
+  return cc ? `+${cc}${digits}` : `+${digits}`;
 }
 
 
@@ -516,6 +542,13 @@ app.post('/api/monitors', async (req, res) => {
       dbFreq = 'Only when rate is achieved';
     }
 
+    // --- phone normalization & validation (ADD THIS BLOCK) ---
+    const phoneNorm = normalizePhone(phone) || null;
+    if (phone && (!phoneNorm || !/^\+\d{10,15}$/.test(phoneNorm))) {
+      return res.status(400).json({ error: 'Invalid phone number format' });
+    }
+    // --------------------------------------------------------
+
     const result = await pool.query(
       `INSERT INTO rate_monitors 
        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
@@ -529,14 +562,23 @@ app.post('/api/monitors', async (req, res) => {
         currentRate,        // initial_rate
         currentRate,        // current_rate (start equal to initial)
         dbFreq,             // update_frequency
-        phone || null       // phone
+        phoneNorm           // phone
       ]
     );
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    // Turn duplicate-active-monitor into a 409 so Quote can show a friendly message
+    if (error?.code === '23505' && (error?.constraint === 'uniq_active_monitor' ||
+                                     /uniq_active_monitor/i.test(error?.detail || ''))) {
+      return res.status(409).json({
+        error: 'duplicate_monitor',
+        message: 'You already have an active alert for this currency pair. Cancel it first or choose a different target.'
+      });
+    }
+  
     console.error('Create monitor error:', error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
