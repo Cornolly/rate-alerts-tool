@@ -570,31 +570,36 @@ app.post('/api/monitors', async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    let margin = 0.005; // default 0.5%
+    // margin: default 0.5%, override from Pipedrive if present and non-negative
+    let margin = 0.005;
     try {
       const m = await pipeDriveService.getPersonMargin(pdId);
-      if (Number.isFinite(m)) margin = m;
+      if (Number.isFinite(m) && m >= 0) margin = m;
     } catch (_) {
       if (VERBOSE) console.log('getPersonMargin failed; using default', margin);
     }
-    // --------------------------------------------------------
 
-    // 🔽 REPLACE your old INSERT with this one (adds margin + phoneNorm)
+    // derive market trigger if caller didn't supply one
+    const finalMarketRate = targetMarketRate ?? (Number(targetClientRate) * (1 + margin));
+
+    // (re)derive direction if not provided, using the *final* market rate
+    let direction = triggerDirection;
+    if (!direction) {
+      direction = finalMarketRate > currentRate ? 'above' : 'below';
+    }
+
+    // INSERT — note finalMarketRate + phoneNorm + margin
     const result = await pool.query(
-      `INSERT INTO rate_monitors 
-       (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
-        target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
-        initial_rate, current_rate, update_frequency, phone, margin)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-       RETURNING *`,
+      `INSERT INTO rate_monitors
+        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount,
+          target_client_rate, target_market_rate, alert_or_order, trigger_direction,
+          initial_rate, current_rate, update_frequency, phone, margin)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      RETURNING *`,
       [
         pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
-        targetClientRate, targetMarketRate, alertOrOrder, direction,
-        currentRate,                      // initial_rate
-        currentRate,                      // current_rate
-        dbFreq,                           // update_frequency
-        phoneNorm,                        // phone
-        margin                            // margin
+        targetClientRate, finalMarketRate, alertOrOrder, direction,
+        currentRate, currentRate, dbFreq, phoneNorm, margin
       ]
     );
 
