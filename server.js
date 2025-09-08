@@ -61,29 +61,30 @@ async function initializeDatabase() {
   // 🔽 NEW: margin + generated current_client_rate
   // (If you don't want an upper limit, remove "AND margin <= 1" in the CHECK.)
   const addMarginAndClientRate = `
-    ALTER TABLE rate_monitors
-      ADD COLUMN IF NOT EXISTS margin NUMERIC(10,6)
-      CHECK (margin >= 0 AND margin <= 1);
+  ALTER TABLE rate_monitors
+    ADD COLUMN IF NOT EXISTS margin NUMERIC(10,6)
+    CHECK (margin >= 0);  -- no upper cap
 
-    -- If a plain current_client_rate exists, drop it so we can re-add as generated
-    ALTER TABLE rate_monitors DROP COLUMN IF EXISTS current_client_rate;
+  -- drop any plain current_client_rate so we can re-add as generated
+  ALTER TABLE rate_monitors DROP COLUMN IF EXISTS current_client_rate;
 
-    -- Re-add as generated (stored) = current_rate * (1 + margin)
-    ALTER TABLE rate_monitors
-      ADD COLUMN current_client_rate NUMERIC(10,6)
-      GENERATED ALWAYS AS (
-        ROUND(current_rate * (1 + COALESCE(margin, 0)), 6)
-      ) STORED;
+  -- client = market / (1 + margin)
+  ALTER TABLE rate_monitors
+    ADD COLUMN current_client_rate NUMERIC(10,6)
+    GENERATED ALWAYS AS (
+      ROUND( current_rate / NULLIF(1 + COALESCE(margin, 0), 0), 6 )
+    ) STORED;
 
-    -- Default margin for existing rows (0.5%); change to your preferred default
-    ALTER TABLE rate_monitors ALTER COLUMN margin SET DEFAULT 0.005;
-    UPDATE rate_monitors SET margin = 0.005 WHERE margin IS NULL;
+  ALTER TABLE rate_monitors ALTER COLUMN margin SET DEFAULT 0.005;
+  UPDATE rate_monitors SET margin = 0.005 WHERE margin IS NULL;
   `;
+
 
   try {
     await pool.query(createTableAndIndexes);
     await pool.query(alterTable);
-    await pool.query(createPartialUnique); // <-- add this line
+    await pool.query(createPartialUnique);
+    await pool.query(addMarginAndClientRate);
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -402,6 +403,8 @@ async function checkRates() {
       ['active']
     );
 
+    const triggeredMonitors = [];
+
     for (const monitor of monitors) {
       const currentRate = await rateService.getRate(
         monitor.sell_currency,
@@ -413,22 +416,38 @@ async function checkRates() {
         continue;
       }
 
-      // keep current snapshot fresh
-      await pool.query(
-        'UPDATE rate_monitors SET current_rate = $1, last_checked = CURRENT_TIMESTAMP WHERE id = $2',
+      // Update snapshot and read DB-computed client rate in same statement
+      const { rows: [snap] } = await pool.query(
+        `UPDATE rate_monitors
+           SET current_rate = $1,
+               last_checked = NOW()
+         WHERE id = $2
+         RETURNING current_rate, current_client_rate, margin`,
         [currentRate, monitor.id]
       );
 
+      const dbCurrent = Number(snap.current_rate);
+      const clientNow = Number(snap.current_client_rate);
+
       const targetMet =
         monitor.trigger_direction === 'above'
-          ? currentRate >= Number(monitor.target_market_rate)
-          : currentRate <= Number(monitor.target_market_rate);
+          ? dbCurrent >= Number(monitor.target_market_rate)
+          : dbCurrent <= Number(monitor.target_market_rate);
 
-      if (!targetMet) continue;
+      if (targetMet) {
+        triggeredMonitors.push({
+          monitor,
+          currentRate: dbCurrent,
+          currentClientRate: clientNow
+        });
+      }
+    }
 
-      console.log(`🎯 target met for monitor ${monitor.id} (mode=${monitor.alert_or_order})`);
+    // Process triggers after scanning all rows
+    for (const item of triggeredMonitors) {
+      const { monitor, currentRate, currentClientRate } = item;
 
-      // Atomically claim the row (prevents dup sends)
+      // Atomic claim to avoid dup sends
       const claim = await pool.query(
         `UPDATE rate_monitors
            SET status = 'triggered', triggered_at = NOW()
@@ -436,14 +455,10 @@ async function checkRates() {
          RETURNING id`,
         [monitor.id]
       );
-
-      if (claim.rowCount === 0) {
-        console.log(`↪️ already handled monitor ${monitor.id}, skipping notify`);
-        continue;
-      }
+      if (claim.rowCount === 0) continue;
 
       if (monitor.alert_or_order === 'alert') {
-        await notifyQuoteTriggered(monitor, currentRate);
+        await notifyQuoteTriggered(monitor, { currentRate, currentClientRate });
       } else {
         await handleOrder(monitor, currentRate);
       }
@@ -612,7 +627,7 @@ app.post('/api/monitors', async (req, res) => {
 });
 
 // tell Quote to send the "alert_triggerd" template
-async function notifyQuoteTriggered(monitor, currentRate) {
+async function notifyQuoteTriggered(monitor, { currentRate, currentClientRate }) {
   try {
     if (!process.env.QUOTE_BASE_URL) {
       console.error('❌ QUOTE_BASE_URL not set');
@@ -633,12 +648,15 @@ async function notifyQuoteTriggered(monitor, currentRate) {
       sellCurrency: monitor.sell_currency,
       buyCurrency: monitor.buy_currency,
       targetClientRate: Number(monitor.target_client_rate),
-      currentClientRate: Number(monitor.current_client_rate ?? monitor.target_client_rate)
+      // Prefer DB-computed client rate at trigger time; fall back to target if missing
+      currentClientRate: Number(currentClientRate ?? monitor.target_client_rate)
     };
+
     if (VERBOSE) console.log('📤 POST to Quote', { url, payload });
 
     const r = await axios.post(url, payload, {
-      headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET }
+      headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET },
+      timeout: 10000
     });
     if (VERBOSE) console.log('✅ Quote responded', { status: r.status, data: r.data });
   } catch (e) {
@@ -649,7 +667,6 @@ async function notifyQuoteTriggered(monitor, currentRate) {
     });
   }
 }
-
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
