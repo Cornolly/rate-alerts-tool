@@ -931,8 +931,16 @@ app.post('/api/monitors', validateMonitorInput, async (req, res) => {
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    // 👇 Add this block (replaces your old generic catch)
+    if (error.code === '23505' && error.constraint === 'uniq_active_monitor') {
+      return res.status(409).json({
+        error: 'duplicate_monitor',
+        message: 'You already have an active alert for this currency pair. Cancel it first or choose a different target.'
+      });
+    }
+
     console.error('Create monitor error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
