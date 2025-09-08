@@ -58,6 +58,28 @@ async function initializeDatabase() {
     WHERE status = 'active';
   `;
 
+  // 🔽 NEW: margin + generated current_client_rate
+  // (If you don't want an upper limit, remove "AND margin <= 1" in the CHECK.)
+  const addMarginAndClientRate = `
+    ALTER TABLE rate_monitors
+      ADD COLUMN IF NOT EXISTS margin NUMERIC(10,6)
+      CHECK (margin >= 0 AND margin <= 1);
+
+    -- If a plain current_client_rate exists, drop it so we can re-add as generated
+    ALTER TABLE rate_monitors DROP COLUMN IF EXISTS current_client_rate;
+
+    -- Re-add as generated (stored) = current_rate * (1 + margin)
+    ALTER TABLE rate_monitors
+      ADD COLUMN current_client_rate NUMERIC(10,6)
+      GENERATED ALWAYS AS (
+        ROUND(current_rate * (1 + COALESCE(margin, 0)), 6)
+      ) STORED;
+
+    -- Default margin for existing rows (0.5%); change to your preferred default
+    ALTER TABLE rate_monitors ALTER COLUMN margin SET DEFAULT 0.005;
+    UPDATE rate_monitors SET margin = 0.005 WHERE margin IS NULL;
+  `;
+
   try {
     await pool.query(createTableAndIndexes);
     await pool.query(alterTable);
@@ -547,22 +569,32 @@ app.post('/api/monitors', async (req, res) => {
     if (phone && (!phoneNorm || !/^\+\d{10,15}$/.test(phoneNorm))) {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
+
+    let margin = 0.005; // default 0.5%
+    try {
+      const m = await pipeDriveService.getPersonMargin(pdId);
+      if (Number.isFinite(m)) margin = m;
+    } catch (_) {
+      if (VERBOSE) console.log('getPersonMargin failed; using default', margin);
+    }
     // --------------------------------------------------------
 
+    // 🔽 REPLACE your old INSERT with this one (adds margin + phoneNorm)
     const result = await pool.query(
       `INSERT INTO rate_monitors 
        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
         target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
-        initial_rate, current_rate, update_frequency, phone)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        initial_rate, current_rate, update_frequency, phone, margin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
         pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
         targetClientRate, targetMarketRate, alertOrOrder, direction,
-        currentRate,        // initial_rate
-        currentRate,        // current_rate (start equal to initial)
-        dbFreq,             // update_frequency
-        phoneNorm           // phone
+        currentRate,                      // initial_rate
+        currentRate,                      // current_rate
+        dbFreq,                           // update_frequency
+        phoneNorm,                        // phone
+        margin                            // margin
       ]
     );
 
