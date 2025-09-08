@@ -636,7 +636,7 @@ async function notifyQuoteTriggered(monitor, currentRate) {
       sellCurrency: monitor.sell_currency,
       buyCurrency: monitor.buy_currency,
       targetClientRate: Number(monitor.target_client_rate),
-      currentClientRate: Number(monitor.target_client_rate)
+      currentClientRate: Number(monitor.current_client_rate ?? monitor.target_client_rate)
     };
     if (VERBOSE) console.log('📤 POST to Quote', { url, payload });
 
