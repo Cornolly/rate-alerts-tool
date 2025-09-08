@@ -1537,7 +1537,6 @@ async function handleTargetRateInput(phoneNumber, targetRate) {
   }
 }
 
-
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
