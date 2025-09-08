@@ -576,12 +576,6 @@ app.post('/api/monitors', async (req, res) => {
     // Derive market trigger if caller didn't supply one (market = client * (1 + margin))
     const finalMarketRate = targetMarketRate ?? (Number(targetClientRate) * (1 + margin));
 
-    // Normalize/validate phone (if you haven’t already)
-    const phoneNorm = normalizePhone(phone) || null;
-    if (phone && phoneNorm && !/^\+\d{10,15}$/.test(phoneNorm)) {
-      return res.status(400).json({ error: 'Invalid phone number format' });
-    }
-
     // Re-derive direction if not provided, using the *final* market rate
     const finalDirection = triggerDirection || (finalMarketRate > currentRate ? 'above' : 'below');
 
