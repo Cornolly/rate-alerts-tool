@@ -51,6 +51,16 @@ async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS phone VARCHAR(32);
   `;
 
+  const addNextUpdateAt = `
+  ALTER TABLE rate_monitors
+    ADD COLUMN IF NOT EXISTS next_update_at TIMESTAMPTZ;
+
+  CREATE INDEX IF NOT EXISTS idx_next_update_due
+    ON rate_monitors(next_update_at)
+    WHERE status = 'active'
+      AND update_frequency IN ('Daily','Weekly');
+`;
+
   // Enforce one active monitor per (pd_id, pair, phone)
   const createPartialUnique = `
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_monitor
@@ -85,6 +95,7 @@ async function initializeDatabase() {
     await pool.query(alterTable);
     await pool.query(createPartialUnique);
     await pool.query(addMarginAndClientRate);
+    await pool.query(addNextUpdateAt);
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -470,6 +481,49 @@ async function checkRates() {
   }
 }
 
+// <<< add this near checkRates() >>>
+async function sendDueUpdates() {
+  // due = active + Daily/Weekly + next_update_at reached
+  const { rows: due } = await pool.query(
+    `SELECT * FROM rate_monitors
+     WHERE status = 'active'
+       AND update_frequency IN ('Daily','Weekly')
+       AND next_update_at IS NOT NULL
+       AND next_update_at <= NOW()`
+  );
+
+  for (const monitor of due) {
+    // fresh market snapshot
+    const currentRate = await rateService.getRate(monitor.sell_currency, monitor.buy_currency);
+    if (!currentRate) continue;
+
+    // update snapshot & get DB-computed client rate
+    const { rows: [snap] } = await pool.query(
+      `UPDATE rate_monitors
+         SET current_rate = $1,
+             last_checked = NOW()
+       WHERE id = $2
+       RETURNING current_client_rate`,
+      [currentRate, monitor.id]
+    );
+
+    // ✅ THIS is the line you asked about
+    await notifyQuoteUpdate(monitor, {
+      currentClientRate: Number(snap.current_client_rate),
+      period: monitor.update_frequency
+    });
+
+    // bump next_update_at by 1 day or 7 days to keep the same time-of-day
+    const bump = monitor.update_frequency === 'Weekly' ? '7 days' : '1 day';
+    await pool.query(
+      `UPDATE rate_monitors
+         SET next_update_at = (next_update_at + INTERVAL '${bump}')
+       WHERE id = $1`,
+      [monitor.id]
+    );
+  }
+}
+
 
 async function handleAlert(monitor, currentRate) {
   try {
@@ -587,6 +641,14 @@ app.post('/api/monitors', async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
+    // Next update time aligned to creation moment
+    let nextUpdateAt = null;
+    if (dbFreq === 'Daily') {
+      nextUpdateAt = new Date(Date.now() + 24*60*60*1000).toISOString();
+    } else if (dbFreq === 'Weekly') {
+      nextUpdateAt = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+    }
+
     // margin: default 0.5%, override from Pipedrive if present and non-negative
     let margin = 0.005;
     try {
@@ -607,13 +669,13 @@ app.post('/api/monitors', async (req, res) => {
       `INSERT INTO rate_monitors 
         (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
           target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
-          initial_rate, current_rate, update_frequency, phone, margin)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          initial_rate, current_rate, update_frequency, phone, margin, next_update_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING *`,
       [
         pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
         targetClientRate, finalMarketRate, alertOrOrder, finalDirection,
-        currentRate, currentRate, dbFreq, phoneNorm, margin
+        currentRate, currentRate, dbFreq, phoneNorm, margin, nextUpdateAt
       ]
     );
 
@@ -640,7 +702,8 @@ app.patch('/api/monitors/:id/stop-updates', requireInternal, async (req, res) =>
   try {
     const { rows } = await pool.query(
       `UPDATE rate_monitors
-         SET update_frequency = 'Only when rate is achieved'
+         SET update_frequency = 'Only when rate is achieved',
+          next_update_at   = NULL
        WHERE id = $1
        RETURNING *`,
       [id]
@@ -707,6 +770,38 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
   }
 });
 
+// send the "alert_update" (Daily/Weekly) template via Quote
+async function notifyQuoteUpdate(monitor, { currentClientRate, period }) {
+  try {
+    if (!process.env.QUOTE_BASE_URL || !process.env.INTERNAL_SHARED_SECRET) return;
+    if (!monitor.phone) return;
+
+    const url = `${process.env.QUOTE_BASE_URL}/api/send-alert-update`;
+    const payload = {
+      phone: monitor.phone,
+      sellCurrency: monitor.sell_currency,
+      buyCurrency: monitor.buy_currency,
+      targetClientRate: Number(monitor.target_client_rate),
+      currentClientRate: Number(currentClientRate),
+      // Quote expects "period": "daily" | "weekly"
+      period: (period || monitor.update_frequency || 'Daily')
+                .toString().toLowerCase().startsWith('week') ? 'weekly' : 'daily'
+    };
+
+    if (VERBOSE) console.log('📤 POST to Quote (alert_update)', { url, payload });
+    await axios.post(url, payload, {
+      headers: { 'x-internal-secret': process.env.INTERNAL_SHARED_SECRET },
+      timeout: 10000
+    });
+  } catch (e) {
+    console.error('❌ notifyQuoteUpdate failed', {
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message
+    });
+  }
+}
+
 
 // tell Quote to send the "alert_triggerd" template
 async function notifyQuoteTriggered(monitor, { currentRate, currentClientRate }) {
@@ -756,7 +851,8 @@ app.patch('/api/monitors/:id/cancel', requireInternal, async (req, res) => {
   try {
     const { rowCount, rows } = await pool.query(
       `UPDATE rate_monitors
-         SET status = 'cancelled'
+         SET status = 'cancelled',
+          next_update_at   = NULL
        WHERE id = $1 AND status = 'active'
        RETURNING *`,
       [id]
@@ -1324,18 +1420,16 @@ app.get('/health', (req, res) => {
 
 // Dynamic scheduling based on proximity to targets
 let currentCronJob = null;
+let currentUpdateJob = null;
 
 function scheduleNextCheck() {
-  // Cancel existing job if any
-  if (currentCronJob) {
-    currentCronJob.stop();
-  }
-  
-  // Determine if we need frequent checks (every 1 minute vs every 15 minutes)
+  // Cancel existing job if any (only the rate-check job)
+  if (currentCronJob) currentCronJob.stop();
+
   pool.query('SELECT * FROM rate_monitors WHERE status = $1', ['active'])
     .then(result => {
       let needsFrequentCheck = false;
-      
+
       for (const monitor of result.rows) {
         if (monitor.current_rate) {
           const proximityPercent = Math.abs(monitor.current_rate - monitor.target_market_rate) / monitor.target_market_rate;
@@ -1345,7 +1439,7 @@ function scheduleNextCheck() {
           }
         }
       }
-      
+
       if (needsFrequentCheck) {
         console.log('Close to targets detected - switching to 1-minute checks');
         currentCronJob = cron.schedule('* * * * *', () => {
@@ -1359,6 +1453,17 @@ function scheduleNextCheck() {
           checkRatesAndReschedule();
         });
       }
+
+      // 🔹 Make sure the DAILY/WEEKLY update pinger runs every minute
+      if (!currentUpdateJob) {
+        currentUpdateJob = cron.schedule('* * * * *', async () => {
+          try {
+            await sendDueUpdates();  // calls Quote with alert_update where next_update_at <= now()
+          } catch (e) {
+            console.error('sendDueUpdates error', e);
+          }
+        });
+      }
     })
     .catch(err => {
       console.error('Error determining check frequency:', err);
@@ -1367,8 +1472,20 @@ function scheduleNextCheck() {
         console.log('Fallback rate check triggered');
         checkRatesAndReschedule();
       });
+
+      // 🔹 Also ensure the updates job is running in the fallback path
+      if (!currentUpdateJob) {
+        currentUpdateJob = cron.schedule('* * * * *', async () => {
+          try {
+            await sendDueUpdates();
+          } catch (e) {
+            console.error('sendDueUpdates error', e);
+          }
+        });
+      }
     });
 }
+
 
 async function checkRatesAndReschedule() {
   await checkRates();
