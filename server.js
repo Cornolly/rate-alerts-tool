@@ -660,35 +660,44 @@ app.patch('/api/monitors/:id/stop-updates', requireInternal, async (req, res) =>
 app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) => {
   const { id } = req.params;
   const newClient = Number(req.body?.targetClientRate);
-  const reactivate = !!req.body?.reactivate;
 
   if (!Number.isFinite(newClient) || newClient <= 0) {
     return res.status(400).json({ error: 'invalid_target_client_rate' });
   }
 
   try {
-    // Get margin + current snapshot from the row
+    // Read margin/current/status
     const { rows: pre } = await pool.query(
-      `SELECT margin, current_rate, status FROM rate_monitors WHERE id = $1`,
+      `SELECT margin, current_rate, status
+         FROM rate_monitors
+        WHERE id = $1`,
       [id]
     );
     if (pre.length === 0) return res.status(404).json({ error: 'not_found' });
 
-    const row = pre[0];
-    const margin = Number(row.margin ?? 0);
-    const currentRate = Number(row.current_rate ?? 0);
+    // Only allow updates on active rows
+    if (pre[0].status !== 'active') {
+      return res.status(409).json({
+        error: 'not_active',
+        message: 'Only active monitors can change the target.'
+      });
+    }
+
+    const margin = Number(pre[0].margin ?? 0);
+    const currentRate = Number(pre[0].current_rate ?? 0);
+
+    // market = client * (1 + margin)
     const marketTarget = Math.round(newClient * (1 + margin) * 1e6) / 1e6;
     const direction = marketTarget > currentRate ? 'above' : 'below';
 
     const { rows: updated } = await pool.query(
       `UPDATE rate_monitors
-         SET target_client_rate = $2,
-             target_market_rate = $3,
-             trigger_direction  = $4,
-             status = CASE WHEN $5::boolean AND status = 'triggered' THEN 'active' ELSE status END
-       WHERE id = $1
-       RETURNING *`,
-      [id, newClient, marketTarget, direction, reactivate]
+          SET target_client_rate = $2,
+              target_market_rate = $3,
+              trigger_direction  = $4
+        WHERE id = $1 AND status = 'active'
+        RETURNING *`,
+      [id, newClient, marketTarget, direction]
     );
 
     return res.json(updated[0]);
@@ -740,6 +749,28 @@ async function notifyQuoteTriggered(monitor, { currentRate, currentClientRate })
     });
   }
 }
+
+// CANCEL an active monitor
+app.patch('/api/monitors/:id/cancel', requireInternal, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rowCount, rows } = await pool.query(
+      `UPDATE rate_monitors
+         SET status = 'cancelled'
+       WHERE id = $1 AND status = 'active'
+       RETURNING *`,
+      [id]
+    );
+    if (rowCount === 0) {
+      return res.status(409).json({ error: 'not_active_or_missing' });
+    }
+    return res.json(rows[0]);
+  } catch (e) {
+    console.error('cancel endpoint error', e);
+    return res.status(500).json({ error: 'cancel_failed' });
+  }
+});
+
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
