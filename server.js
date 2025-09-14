@@ -522,6 +522,14 @@ async function getClientData(pdId) {
 
 // API Routes
 
+// --- Internal auth helper (PUT THIS HERE, once, before your routes) ---
+function requireInternal(req, res, next) {
+  if (req.headers['x-internal-secret'] !== process.env.INTERNAL_SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
 // Get all monitors
 app.get('/api/monitors', async (req, res) => {
   try {
@@ -625,6 +633,71 @@ app.post('/api/monitors', async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// 2) Stop updates → only notify when target is achieved
+app.patch('/api/monitors/:id/stop-updates', requireInternal, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE rate_monitors
+         SET update_frequency = 'Only when rate is achieved'
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'not_found', message: 'Monitor not found' });
+    }
+    return res.json(rows[0]);
+  } catch (err) {
+    console.error('stop-updates error:', err);
+    return res.status(500).json({ error: 'internal', message: 'Failed to stop updates' });
+  }
+});
+
+// PATCH /api/monitors/:id/update-target
+app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) => {
+  const { id } = req.params;
+  const newClient = Number(req.body?.targetClientRate);
+  const reactivate = !!req.body?.reactivate;
+
+  if (!Number.isFinite(newClient) || newClient <= 0) {
+    return res.status(400).json({ error: 'invalid_target_client_rate' });
+  }
+
+  try {
+    // Get margin + current snapshot from the row
+    const { rows: pre } = await pool.query(
+      `SELECT margin, current_rate, status FROM rate_monitors WHERE id = $1`,
+      [id]
+    );
+    if (pre.length === 0) return res.status(404).json({ error: 'not_found' });
+
+    const row = pre[0];
+    const margin = Number(row.margin ?? 0);
+    const currentRate = Number(row.current_rate ?? 0);
+    const marketTarget = Math.round(newClient * (1 + margin) * 1e6) / 1e6;
+    const direction = marketTarget > currentRate ? 'above' : 'below';
+
+    const { rows: updated } = await pool.query(
+      `UPDATE rate_monitors
+         SET target_client_rate = $2,
+             target_market_rate = $3,
+             trigger_direction  = $4,
+             status = CASE WHEN $5::boolean AND status = 'triggered' THEN 'active' ELSE status END
+       WHERE id = $1
+       RETURNING *`,
+      [id, newClient, marketTarget, direction, reactivate]
+    );
+
+    return res.json(updated[0]);
+  } catch (err) {
+    console.error('update-target error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 
 // tell Quote to send the "alert_triggerd" template
 async function notifyQuoteTriggered(monitor, { currentRate, currentClientRate }) {
