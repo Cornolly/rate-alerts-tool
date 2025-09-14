@@ -786,7 +786,7 @@ async function notifyQuoteUpdate(monitor, { currentClientRate, period }) {
       // Quote expects "period": "daily" | "weekly"
       period: (period || monitor.update_frequency || 'Daily')
                 .toString().toLowerCase().startsWith('week') ? 'weekly' : 'daily',
-      monitorId: monitor.id,
+      monitorId: String(monitor.id),
     };
 
     if (VERBOSE) console.log('📤 POST to Quote (alert_update)', { url, payload });
