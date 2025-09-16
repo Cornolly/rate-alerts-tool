@@ -659,25 +659,59 @@ app.post('/api/monitors', async (req, res) => {
     }
 
     // Derive market trigger if caller didn't supply one (market = client * (1 + margin))
-    const finalMarketRate = targetMarketRate ?? (Number(targetClientRate) * (1 + margin));
+    let finalTargetClient = Number(targetClientRate);
+    let finalSell = sellCurrency;
+    let finalBuy  = buyCurrency;
+    let finalCurrent = Number(currentRate);
 
-    // Re-derive direction if not provided, using the *final* market rate
-    const finalDirection = triggerDirection || (finalMarketRate > currentRate ? 'above' : 'below');
+    // guard
+    if (!Number.isFinite(finalTargetClient) || finalTargetClient <= 0) {
+      return res.status(400).json({ error: 'invalid_target_client_rate' });
+    }
 
-    // INSERT — note finalMarketRate + phoneNorm + margin
+    const initialMarketRate = targetMarketRate ?? (finalTargetClient * (1 + margin));
+
+    // If this would be 'below', or looks like the inverse (>20% off), flip & invert
+    const MISPRICE_TOL = 0.20; // 20% heuristic
+    const ratioToMarket = initialMarketRate / finalCurrent;
+
+    if (initialMarketRate <= finalCurrent || ratioToMarket > (1 + MISPRICE_TOL)) {
+      [finalSell, finalBuy] = [finalBuy, finalSell];
+      finalTargetClient = 1 / finalTargetClient;
+      finalCurrent      = 1 / finalCurrent;
+    }
+
+    // Always store as 'above'
+    const finalDirection = 'above';
+    const finalTargetMarket = finalTargetClient * (1 + margin);
+
+    // INSERT — use the *normalized* values
     const result = await pool.query(
       `INSERT INTO rate_monitors 
-        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount, 
-          target_client_rate, target_market_rate, alert_or_order, trigger_direction, 
-          initial_rate, current_rate, update_frequency, phone, margin, next_update_at)
+        (pd_id, sell_currency, buy_currency, sell_amount, buy_amount,
+        target_client_rate, target_market_rate, alert_or_order, trigger_direction,
+        initial_rate, current_rate, update_frequency, phone, margin, next_update_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
       RETURNING *`,
       [
-        pdId, sellCurrency, buyCurrency, sellAmount, buyAmount,
-        targetClientRate, finalMarketRate, alertOrOrder, finalDirection,
-        currentRate, currentRate, dbFreq, phoneNorm, margin, nextUpdateAt
+        pdId,
+        finalSell,
+        finalBuy,
+        sellAmount,
+        buyAmount,
+        finalTargetClient,
+        finalTargetMarket,   // <-- normalized!
+        alertOrOrder,
+        finalDirection,      // 'above'
+        finalCurrent,        // initial_rate (normalized snapshot)
+        finalCurrent,        // current_rate
+        dbFreq,
+        phoneNorm,
+        margin,
+        nextUpdateAt
       ]
     );
+
 
 
     res.status(201).json(result.rows[0]);
@@ -738,7 +772,6 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
     );
     if (pre.length === 0) return res.status(404).json({ error: 'not_found' });
 
-    // Only allow updates on active rows
     if (pre[0].status !== 'active') {
       return res.status(409).json({
         error: 'not_active',
@@ -751,16 +784,33 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
 
     // market = client * (1 + margin)
     const marketTarget = Math.round(newClient * (1 + margin) * 1e6) / 1e6;
-    const direction = marketTarget > currentRate ? 'above' : 'below';
+
+    // 🔽 MINIMAL NORMALIZATION: always store as 'above'
+    let finalClient  = newClient;
+    let finalMarket  = marketTarget;
+    let finalCurrent = currentRate;
+
+    // If it would be 'below', invert so we can store 'above'
+    if (finalMarket <= finalCurrent) {
+      finalClient  = 1 / finalClient;
+      finalMarket  = 1 / finalMarket;
+      finalCurrent = 1 / finalCurrent;
+      // keep 6dp like before
+      finalClient = Math.round(finalClient * 1e6) / 1e6;
+      finalMarket = Math.round(finalMarket * 1e6) / 1e6;
+    }
+
+    const direction = 'above';
 
     const { rows: updated } = await pool.query(
       `UPDATE rate_monitors
           SET target_client_rate = $2,
               target_market_rate = $3,
-              trigger_direction  = $4
+              trigger_direction  = $4,
+              current_rate       = $5
         WHERE id = $1 AND status = 'active'
         RETURNING *`,
-      [id, newClient, marketTarget, direction]
+      [id, finalClient, finalMarket, direction, finalCurrent]
     );
 
     return res.json(updated[0]);
@@ -769,6 +819,7 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
     return res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // send the "alert_update" (Daily/Weekly) template via Quote
 async function notifyQuoteUpdate(monitor, { currentClientRate, period }) {
@@ -1344,14 +1395,12 @@ async function requestTargetRate(phoneNumber, flowState) {
 
 async function handleTargetRateInput(phoneNumber, targetRate) {
   const currentState = userFlowState.get(phoneNumber);
-  
   if (!currentState || !currentState.sellCurrency || !currentState.buyCurrency) {
-    // User sent a number but we don't have their flow state
-    return;
+    return; // no flow state
   }
-  
+
   try {
-    // Find client in PipeDrive by phone number
+    // 1) Find client in PD
     const client = await pipeDriveService.searchPersonByPhone(phoneNumber);
     if (!client) {
       await whatsappService.sendMessage(phoneNumber, {
@@ -1362,47 +1411,64 @@ async function handleTargetRateInput(phoneNumber, targetRate) {
       });
       return;
     }
-    
-    // Get client margin from PipeDrive
-    const clientMargin = await pipeDriveService.getPersonMargin(client.id);
-    
-    // Calculate market rate (client rate minus margin)
-    const marketRate = targetRate * (1 - clientMargin);
-    
-    // Create the rate monitor
+
+    // 2) Get client margin
+    const clientMargin = await pipeDriveService.getPersonMargin(client.id); // decimal, e.g. 0.005
+
+    // 3) Get live market (sell->buy)
+    const live = await rateService.getRate(currentState.sellCurrency, currentState.buyCurrency);
+
+    // 4) Normalize so we ALWAYS store an 'above' alert
+    let clientTarget = Number(targetRate);
+    let marketTarget = clientTarget * (1 + clientMargin);  // market = client * (1 + margin)
+    let sell = currentState.sellCurrency;
+    let buy  = currentState.buyCurrency;
+    let current = Number(live);
+
+    // If it would be 'below', invert so we can store 'above'
+    if (marketTarget <= current) {
+      [sell, buy] = [buy, sell];
+      clientTarget = 1 / clientTarget;
+      marketTarget = 1 / marketTarget;
+      current      = 1 / current;
+    }
+
+    const triggerDirection = 'above'; // always
+
+    // 5) Create the monitor (use normalized values)
     const monitor = await pool.query(
       `INSERT INTO rate_monitors 
        (pd_id, sell_currency, buy_currency, target_client_rate, target_market_rate, 
-        alert_or_order, update_frequency, trigger_direction, initial_rate, current_rate)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9) RETURNING *`,
+        alert_or_order, update_frequency, trigger_direction, initial_rate, current_rate, margin)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10)
+       RETURNING *`,
       [
         client.id.toString(),
-        currentState.sellCurrency,
-        currentState.buyCurrency,
-        targetRate,
-        marketRate,
-        'alert', // Default to alert
+        sell,
+        buy,
+        clientTarget,
+        marketTarget,
+        'alert',
         currentState.updateFrequency,
-        'above', // Will be determined by auto-detection logic
-        await rateService.getRate(currentState.sellCurrency, currentState.buyCurrency)
+        triggerDirection,   // 'above'
+        current,            // initial_rate & current_rate (normalized snapshot)
+        clientMargin
       ]
     );
-    
-    // Send confirmation message
+
+    // 6) Confirmation message (echo normalized pair & target)
     await whatsappService.sendMessage(phoneNumber, {
       messaging_product: "whatsapp",
       to: phoneNumber,
       type: "text",
       text: {
-        body: `✅ Rate alert created successfully!\n\nCurrency: ${currentState.sellCurrency}/${currentState.buyCurrency}\nYour target rate: ${targetRate}\nMarket trigger rate: ${marketRate.toFixed(6)}\nUpdate frequency: ${currentState.updateFrequency}\n\nYou'll be notified when the rate reaches your target.`
+        body: `✅ Rate alert created!\n\nCurrency: ${sell}/${buy}\nYour target (client): ${clientTarget.toFixed(6)}\nMarket trigger: ${marketTarget.toFixed(6)}\nUpdates: ${currentState.updateFrequency}\n\nWe'll notify you when the rate reaches your target.`
       }
     });
-    
-    // Clear flow state
+
     userFlowState.delete(phoneNumber);
-    
     console.log('Rate monitor created via WhatsApp:', monitor.rows[0]);
-    
+
   } catch (error) {
     console.error('Error creating rate monitor:', error);
     await whatsappService.sendMessage(phoneNumber, {
@@ -1413,6 +1479,7 @@ async function handleTargetRateInput(phoneNumber, targetRate) {
     });
   }
 }
+
 
 // Health check
 app.get('/health', (req, res) => {
