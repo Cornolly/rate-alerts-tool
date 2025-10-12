@@ -1,6 +1,8 @@
 // Rate Alerts & Market Orders Tool for Railway
 // This tool monitors currency rates and triggers WhatsApp alerts or creates deals
 
+
+const pLimit = require('p-limit');
 const express = require('express');
 const { Pool } = require('pg');
 const cron = require('node-cron');
@@ -19,6 +21,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
+
 
 async function initializeDatabase() {
   const createTableAndIndexes = `
@@ -404,11 +407,14 @@ app.get('/api/rate/:from/:to', async (req, res) => {
   }
 });
 
-// Core monitoring function
+// limit to 5 concurrent pair fetches
+const limit = pLimit(5);
+
+// Optimized core monitoring function - grouped by currency pair, batched updates
 async function checkRates() {
-  // Skip rate checking on weekends (Saturday = 6, Sunday = 0)
-  const today = new Date().getDay();
-  if (today === 0 || today === 6) {
+  // Simple weekend skip (consider UTC market hours if needed)
+  const dow = new Date().getDay();
+  if (dow === 0 || dow === 6) {
     console.log('Weekend detected - skipping rate check', new Date().toISOString());
     return;
   }
@@ -420,71 +426,109 @@ async function checkRates() {
       'SELECT * FROM rate_monitors WHERE status = $1',
       ['active']
     );
-
-    const triggeredMonitors = [];
-
-    for (const monitor of monitors) {
-      const currentRate = await rateService.getRate(
-        monitor.sell_currency,
-        monitor.buy_currency
-      );
-
-      if (!currentRate) {
-        console.log(`Could not fetch rate for ${monitor.sell_currency}/${monitor.buy_currency}`);
-        continue;
-      }
-
-      // Update snapshot and read DB-computed client rate in same statement
-      const { rows: [snap] } = await pool.query(
-        `UPDATE rate_monitors
-           SET current_rate = $1,
-               last_checked = NOW()
-         WHERE id = $2
-         RETURNING current_rate, current_client_rate, margin`,
-        [currentRate, monitor.id]
-      );
-
-      const dbCurrent = Number(snap.current_rate);
-      const clientNow = Number(snap.current_client_rate);
-
-      const targetMet =
-        monitor.trigger_direction === 'above'
-          ? dbCurrent >= Number(monitor.target_market_rate)
-          : dbCurrent <= Number(monitor.target_market_rate);
-
-      if (targetMet) {
-        triggeredMonitors.push({
-          monitor,
-          currentRate: dbCurrent,
-          currentClientRate: clientNow
-        });
-      }
+    if (monitors.length === 0) {
+      console.log('No active monitors. Done.');
+      return;
     }
 
-    // Process triggers after scanning all rows
-    for (const item of triggeredMonitors) {
-      const { monitor, currentRate, currentClientRate } = item;
+    // Group monitors by pair
+    const pairGroups = new Map();
+    for (const m of monitors) {
+      const key = `${m.sell_currency}/${m.buy_currency}`;
+      if (!pairGroups.has(key)) pairGroups.set(key, []);
+      pairGroups.get(key).push(m);
+    }
 
-      // Atomic claim to avoid dup sends
+    console.log(`Checking ${pairGroups.size} unique currency pairs for ${monitors.length} monitors`);
+
+    const triggered = [];
+
+    // Process each pair with limited concurrency
+    await Promise.all(
+      Array.from(pairGroups.entries()).map(([pairKey, pairMonitors]) =>
+        limit(async () => {
+          const [sellCurrency, buyCurrency] = pairKey.split('/');
+          let currentRate;
+          try {
+            currentRate = await rateService.getRate(sellCurrency, buyCurrency);
+          } catch (e) {
+            console.log(`Rate fetch error for ${pairKey}:`, e?.message || e);
+            return;
+          }
+          if (currentRate == null) {
+            console.log(`Could not fetch rate for ${pairKey}`);
+            return;
+          }
+
+          console.log(`${pairKey}: ${currentRate} (checking ${pairMonitors.length} monitors)`);
+
+          // Batch update all monitors for this pair, compute client rate in DB, and return per-row values
+          const ids = pairMonitors.map(m => m.id);
+          const { rows: snaps } = await pool.query(
+            `
+            UPDATE rate_monitors
+               SET current_rate = $1,
+                   last_checked = NOW()
+             WHERE id = ANY($2)
+             RETURNING id, current_rate::float8 AS current_rate,
+                       current_client_rate::float8 AS current_client_rate,
+                       target_market_rate::float8 AS target_market_rate,
+                       trigger_direction, alert_or_order
+            `,
+            [currentRate, ids]
+          );
+
+          // Decide triggers (can move into SQL if you prefer)
+          for (const s of snaps) {
+            const hit = s.trigger_direction === 'above'
+              ? s.current_rate >= s.target_market_rate
+              : s.current_rate <= s.target_market_rate;
+
+            if (hit) {
+              triggered.push({
+                id: s.id,
+                currentRate: s.current_rate,
+                currentClientRate: s.current_client_rate,
+                alertOrOrder: s.alert_or_order
+              });
+            }
+          }
+        })
+      )
+    );
+
+    // Claim & act
+    let alerts = 0;
+    for (const t of triggered) {
       const claim = await pool.query(
         `UPDATE rate_monitors
            SET status = 'triggered', triggered_at = NOW()
          WHERE id = $1 AND status = 'active'
          RETURNING id`,
-        [monitor.id]
+        [t.id]
       );
       if (claim.rowCount === 0) continue;
 
-      if (monitor.alert_or_order === 'alert') {
-        await notifyQuoteTriggered(monitor, { currentRate, currentClientRate });
+      // Fetch full monitor row if your notifiers need more fields
+      const { rows: [monitor] } = await pool.query(
+        'SELECT * FROM rate_monitors WHERE id = $1',
+        [t.id]
+      );
+
+      if (t.alertOrOrder === 'alert') {
+        await notifyQuoteTriggered(monitor, {
+          currentRate: t.currentRate,
+          currentClientRate: t.currentClientRate
+        });
+        alerts++;
       } else {
-        await handleOrder(monitor, currentRate);
+        await handleOrder(monitor, t.currentRate);
       }
     }
 
-    console.log('Rate check completed');
-  } catch (error) {
-    console.error('Rate check error:', error);
+    console.log(`Rate check completed – ${alerts} alerts triggered, ${triggered.length - alerts} orders processed`);
+  } catch (err) {
+    console.error('Rate check error:', err);
   }
 }
 
