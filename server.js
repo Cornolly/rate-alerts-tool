@@ -406,6 +406,13 @@ app.get('/api/rate/:from/:to', async (req, res) => {
 
 // Core monitoring function
 async function checkRates() {
+  // Skip rate checking on weekends (Saturday = 6, Sunday = 0)
+  const today = new Date().getDay();
+  if (today === 0 || today === 6) {
+    console.log('Weekend detected - skipping rate check', new Date().toISOString());
+    return;
+  }
+
   console.log('Starting rate check...', new Date().toISOString());
 
   try {
