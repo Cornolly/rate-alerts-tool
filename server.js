@@ -64,6 +64,15 @@ async function initializeDatabase() {
       AND update_frequency IN ('Daily','Weekly');
 `;
 
+  // 👇 ADD THIS NEW SECTION HERE
+  const addDealTracking = `
+  ALTER TABLE rate_monitors
+    ADD COLUMN IF NOT EXISTS deal_id VARCHAR(255);
+
+  CREATE INDEX IF NOT EXISTS idx_deal_id ON rate_monitors(deal_id)
+    WHERE deal_id IS NOT NULL;
+`;
+
   // Enforce one active monitor per (pd_id, pair, phone)
   const createPartialUnique = `
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_monitor
@@ -99,6 +108,7 @@ async function initializeDatabase() {
     await pool.query(createPartialUnique);
     await pool.query(addMarginAndClientRate);
     await pool.query(addNextUpdateAt);
+    await pool.query(addDealTracking);
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -390,6 +400,95 @@ class PipeDriveService {
       return null;
     }
   }
+
+  // CREATE PIPEDRIVE DEAL FOR ALERTS AND ORDERS
+  async createDeal(dealData) {
+    try {
+      // Determine which pipeline based on alert vs order
+      const stageId = dealData.alertOrOrder === 'order' ? 33 : 32;
+      // 33 = "WhatsApp Orders" → "Created"
+      // 32 = "WhatsApp Alerts" → "Created"
+      
+      const payload = {
+        title: `${dealData.sellCurrency}/${dealData.buyCurrency} ${dealData.alertOrOrder === 'order' ? 'Market Order' : 'Rate Alert'}`,
+        person_id: dealData.pdId,
+        value: dealData.sellAmount || dealData.buyAmount || 0,
+        currency: dealData.sellCurrency,
+        stage_id: stageId,
+        // Custom fields - always set currencies and target rate
+        '167c1d849f7eed69d58bdee08baed1b7a3ff0afb': dealData.sellCurrency, // Sell Currency
+        '731741200ad05c001fec96620d68bb194966584a': dealData.buyCurrency,  // Buy Currency
+        '9ade4f4097884f9e1f8609aa317e2d8c91c1764f': dealData.targetClientRate // Target Rate
+      };
+
+      // Only add amounts for orders (not alerts)
+      if (dealData.alertOrOrder === 'order') {
+        payload['f22207a04feac2295ad23fc3f85ba6855714a015'] = dealData.sellAmount || null; // Sell Amount
+        payload['5d4475d343f7604b8bf1ed40b5b807722d38a5fd'] = dealData.buyAmount || null;  // Buy Amount
+      }
+
+      if (VERBOSE) {
+        console.log('Creating Pipedrive deal:', JSON.stringify(payload, null, 2));
+      }
+
+      const response = await axios.post(
+        `${this.baseURL}/deals?api_token=${this.apiKey}`,
+        payload
+      );
+
+      if (VERBOSE) {
+        console.log('Deal created:', response.data);
+      }
+
+      return response.data.data;
+    } catch (error) {
+      console.error('Error creating Pipedrive deal:', error.response?.data || error);
+      throw error;
+    }
+  }
+
+  // ADD NOTE TO DEAL
+  async addDealNote(dealId, noteContent) {
+    try {
+      const payload = {
+        content: noteContent,
+        deal_id: dealId
+      };
+
+      const response = await axios.post(
+        `${this.baseURL}/notes?api_token=${this.apiKey}`,
+        payload
+      );
+
+      return response.data.data;
+    } catch (error) {
+      console.error('Error adding deal note:', error.response?.data || error);
+      throw error;
+    }
+  }
+
+  // UPDATE DEAL STAGE (move to WhatsApp Trades when triggered)
+  async updateDealStage(dealId, stageId) {
+    try {
+      const payload = {
+        stage_id: stageId
+      };
+
+      const response = await axios.put(
+        `${this.baseURL}/deals/${dealId}?api_token=${this.apiKey}`,
+        payload
+      );
+
+      if (VERBOSE) {
+        console.log('Deal stage updated:', response.data);
+      }
+
+      return response.data.data;
+    } catch (error) {
+      console.error('Error updating deal stage:', error.response?.data || error);
+      throw error;
+    }
+  }    
 }
 
 const rateService = new RateService();
@@ -520,6 +619,8 @@ async function checkRates() {
           currentRate: t.currentRate,
           currentClientRate: t.currentClientRate
         });
+        // Mark the alert deal as won
+        await handleAlertTriggered(monitor, t.currentRate);
         alerts++;
       } else {
         await handleOrder(monitor, t.currentRate);
@@ -599,20 +700,127 @@ async function handleAlert(monitor, currentRate) {
 
 async function handleOrder(monitor, currentRate) {
   try {
-    const dealData = {
-      pdId: monitor.pd_id,
-      sellCurrency: monitor.sell_currency,
-      buyCurrency: monitor.buy_currency,
-      sellAmount: monitor.sell_amount,
-      buyAmount: monitor.buy_amount,
-      targetClientRate: monitor.target_client_rate,
-      currentRate: currentRate
-    };
+    console.log(`📋 Processing triggered market order for monitor ${monitor.id}`);
     
-    await pipelineService.createDeal(dealData);
-    console.log(`Deal created for monitor ${monitor.id}`);
+    if (!monitor.deal_id) {
+      console.error(`❌ No deal_id found for order monitor ${monitor.id}`);
+      return;
+    }
+
+    // Move deal to "WhatsApp Trades" pipeline (stage_id: 14 = "Client Booked")
+    await pipeDriveService.updateDealStage(monitor.deal_id, 14);
+    
+    // Add note about the trigger
+    const noteContent = `✅ Market order TRIGGERED!
+    
+Target Rate: ${monitor.target_client_rate}
+Triggered at Rate: ${currentRate}
+Monitor ID: ${monitor.id}
+
+Ready to book.`;
+    
+    await pipeDriveService.addDealNote(monitor.deal_id, noteContent);
+    
+    console.log(`✅ Deal ${monitor.deal_id} moved to WhatsApp Trades for booking`);
+    
+    // Optionally notify client via WhatsApp (if you want this)
+    if (monitor.phone) {
+      await notifyOrderTriggered(monitor, currentRate);
+    }
   } catch (error) {
-    console.error(`Order handling error for monitor ${monitor.id}:`, error);
+    console.error(`❌ Order handling error for monitor ${monitor.id}:`, error);
+  }
+}
+
+async function handleAlertTriggered(monitor, currentRate) {
+  try {
+    console.log(`🔔 Processing triggered alert for monitor ${monitor.id}`);
+    
+    if (!monitor.deal_id) {
+      console.error(`❌ No deal_id found for alert monitor ${monitor.id}`);
+      return;
+    }
+
+    // Mark deal as won (status: won)
+    await axios.put(
+      `${pipeDriveService.baseURL}/deals/${monitor.deal_id}?api_token=${pipeDriveService.apiKey}`,
+      { status: 'won' }
+    );
+    
+    // Add note about the trigger
+    const noteContent = `✅ Rate alert TRIGGERED!
+    
+Target Rate: ${monitor.target_client_rate}
+Triggered at Rate: ${currentRate}
+Monitor ID: ${monitor.id}
+
+Alert completed successfully.`;
+    
+    await pipeDriveService.addDealNote(monitor.deal_id, noteContent);
+    
+    console.log(`✅ Deal ${monitor.deal_id} marked as won`);
+  } catch (error) {
+    console.error(`❌ Alert handling error for monitor ${monitor.id}:`, error);
+  }
+}
+
+// Tell Quote to send the "order_triggered" template
+async function notifyOrderTriggered(monitor, currentRate) {
+  try {
+    if (!process.env.QUOTE_BASE_URL) {
+      console.error('❌ QUOTE_BASE_URL not set');
+      return;
+    }
+    if (!process.env.INTERNAL_SHARED_SECRET) {
+      console.error('❌ INTERNAL_SHARED_SECRET not set');
+      return;
+    }
+    if (!monitor.phone) {
+      console.error('❌ monitor has no phone; cannot notify Quote', { id: monitor.id });
+      return;
+    }
+
+    // Calculate amounts based on TARGET rate (not triggered rate)
+    const targetRate = Number(monitor.target_client_rate);
+    let sellAmount, buyAmount;
+
+    if (monitor.sell_amount) {
+      // If we have sell_amount, calculate buy_amount
+      sellAmount = Math.round(Number(monitor.sell_amount));
+      buyAmount = Math.round(sellAmount * targetRate);
+    } else if (monitor.buy_amount) {
+      // If we have buy_amount, calculate sell_amount
+      buyAmount = Math.round(Number(monitor.buy_amount));
+      sellAmount = Math.round(buyAmount / targetRate);
+    } else {
+      // Fallback - shouldn't happen but just in case
+      sellAmount = 'See trade confirmation';
+      buyAmount = 'See trade confirmation';
+    }
+
+    const url = `${process.env.QUOTE_BASE_URL}/api/send-order-triggered`;
+    const payload = {
+      phone: monitor.phone,
+      currencyPair: `${monitor.sell_currency}/${monitor.buy_currency}`, // {{1}}
+      targetRate: targetRate.toFixed(4), // {{2}}
+      sellAmount: sellAmount.toLocaleString('en-GB'), // {{3}} - rounded, no decimals
+      buyAmount: buyAmount.toLocaleString('en-GB'), // {{4}} - rounded, no decimals
+      sellCurrency: monitor.sell_currency // {{5}}
+    };
+
+    if (VERBOSE) console.log('📤 POST to Quote (order_triggered)', { url, payload });
+
+    const r = await axios.post(url, payload, {
+      headers: { "x-internal-secret": process.env.INTERNAL_SHARED_SECRET },
+      timeout: 10000
+    });
+    if (VERBOSE) console.log('✅ Quote responded', { status: r.status, data: r.data });
+  } catch (e) {
+    console.error('❌ notifyOrderTriggered failed', {
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message
+    });
   }
 }
 
@@ -657,7 +865,7 @@ app.post('/api/monitors', async (req, res) => {
       buyAmount,
       targetClientRate,
       targetMarketRate,
-      alertOrOrder,
+      alertOrOrder = 'alert', // default to 'alert' if not specified
       triggerDirection,
       // 👇 accept what Quote sends
       updateFrequency,        // e.g. "daily" | "weekly" | "on_target"
@@ -670,6 +878,15 @@ app.post('/api/monitors', async (req, res) => {
       // avoid gigantic payloads
       const pretty = JSON.stringify(req.body, null, 2);
       console.log('MONITOR CREATE BODY:', pretty.length > 4000 ? pretty.slice(0, 4000) + ' …(truncated)' : pretty);
+    }
+
+    // 👇 ADD THE VALIDATION HERE
+    // Validate alertOrOrder
+    if (!['alert', 'order'].includes(alertOrOrder)) {
+      return res.status(400).json({ 
+        error: 'invalid_alert_or_order',
+        message: 'alertOrOrder must be either "alert" or "order"'
+      });
     }
 
     // Get current rate to store as initial/current reference
@@ -763,7 +980,43 @@ app.post('/api/monitors', async (req, res) => {
       ]
     );
 
+    // 👇 NEW CODE STARTS HERE
+    // CREATE PIPEDRIVE DEAL FOR BOTH ALERTS AND ORDERS
+    if (result.rows[0]) {
+      try {
+        const monitor = result.rows[0];
+        const deal = await pipeDriveService.createDeal({
+          pdId: monitor.pd_id,
+          sellCurrency: monitor.sell_currency,
+          buyCurrency: monitor.buy_currency,
+          sellAmount: monitor.sell_amount,
+          buyAmount: monitor.buy_amount,
+          targetClientRate: monitor.target_client_rate,
+          alertOrOrder: monitor.alert_or_order
+        });
 
+        if (deal && deal.id) {
+          await pool.query(
+            'UPDATE rate_monitors SET deal_id = $1 WHERE id = $2',
+            [deal.id.toString(), monitor.id]
+          );
+
+          await pipeDriveService.addDealNote(
+            deal.id,
+            `${monitor.alert_or_order === 'order' ? 'Market order' : 'Rate alert'} created.
+    Target Rate: ${monitor.target_client_rate}
+    Current Rate: ${monitor.current_rate}
+    Update Frequency: ${monitor.update_frequency || 'On target only'}
+    Monitor ID: ${monitor.id}`
+          );
+
+          console.log(`✅ Deal ${deal.id} created for new ${monitor.alert_or_order} monitor ${monitor.id}`);
+        }
+      } catch (dealError) {
+        console.error('Failed to create deal:', dealError);
+      }
+    }
+    // 👆 NEW CODE ENDS HERE
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
