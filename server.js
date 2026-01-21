@@ -939,14 +939,30 @@ app.post('/api/monitors', async (req, res) => {
 
     const initialMarketRate = targetMarketRate ?? (finalTargetClient * (1 + margin));
 
-    // If this would be 'below', or looks like the inverse (>20% off), flip & invert
-    const MISPRICE_TOL = 0.20; // 20% heuristic
-    const ratioToMarket = initialMarketRate / finalCurrent;
+    // For ORDERS: Don't auto-flip - reject if target is already achievable
+    if (alertOrOrder === 'order') {
+      // Check if target is already achievable (including margin)
+      const targetWithMargin = finalTargetClient * (1 + margin);
+      
+      if (targetWithMargin <= finalCurrent) {
+        return res.status(400).json({ 
+          error: 'target_already_achievable',
+          message: `Your target rate of ${finalTargetClient.toFixed(4)} is already achievable at the current market rate of ${finalCurrent.toFixed(4)}. Please request a quote instead.`,
+          currentRate: finalCurrent,
+          targetRate: finalTargetClient
+        });
+      }
+      // For orders, skip the flip logic below
+    } else {
+      // For ALERTS: Apply auto-flip logic only
+      const MISPRICE_TOL = 0.20; // 20% heuristic
+      const ratioToMarket = initialMarketRate / finalCurrent;
 
-    if (initialMarketRate <= finalCurrent || ratioToMarket > (1 + MISPRICE_TOL)) {
-      [finalSell, finalBuy] = [finalBuy, finalSell];
-      finalTargetClient = 1 / finalTargetClient;
-      finalCurrent      = 1 / finalCurrent;
+      if (initialMarketRate <= finalCurrent || ratioToMarket > (1 + MISPRICE_TOL)) {
+        [finalSell, finalBuy] = [finalBuy, finalSell];
+        finalTargetClient = 1 / finalTargetClient;
+        finalCurrent      = 1 / finalCurrent;
+      }
     }
 
     // Always store as 'above'
