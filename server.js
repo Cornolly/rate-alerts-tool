@@ -1242,6 +1242,56 @@ app.patch('/api/monitors/:id/cancel', requireInternal, async (req, res) => {
   }
 });
 
+// Update monitor frequency
+app.patch('/api/monitors/:id/update-frequency', requireInternal, async (req, res) => {
+  const { id } = req.params;
+  const { updateFrequency } = req.body;
+
+  // Normalize the frequency
+  const rawFreq = (updateFrequency || '').toString().trim().toLowerCase();
+  let dbFreq = null;
+  
+  if (rawFreq.startsWith('daily')) {
+    dbFreq = 'Daily';
+  } else if (rawFreq.startsWith('week')) {
+    dbFreq = 'Weekly';
+  } else if (rawFreq === 'on_target' || (rawFreq.includes('only') && rawFreq.includes('achiev'))) {
+    dbFreq = 'Only when rate is achieved';
+  }
+
+  if (!dbFreq) {
+    return res.status(400).json({ error: 'invalid_frequency' });
+  }
+
+  // Calculate new next_update_at based on frequency
+  let nextUpdateAt = null;
+  if (dbFreq === 'Daily') {
+    nextUpdateAt = new Date(Date.now() + 24*60*60*1000).toISOString();
+  } else if (dbFreq === 'Weekly') {
+    nextUpdateAt = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+  }
+
+  try {
+    const { rowCount, rows } = await pool.query(
+      `UPDATE rate_monitors
+         SET update_frequency = $2,
+             next_update_at = $3
+       WHERE id = $1 AND status = 'active'
+       RETURNING *`,
+      [id, dbFreq, nextUpdateAt]
+    );
+    
+    if (rowCount === 0) {
+      return res.status(404).json({ error: 'not_found_or_inactive' });
+    }
+    
+    return res.json(rows[0]);
+  } catch (e) {
+    console.error('update-frequency error', e);
+    return res.status(500).json({ error: 'update_failed' });
+  }
+});
+
 
 // Update monitor
 app.put('/api/monitors/:id', async (req, res) => {
