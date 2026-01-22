@@ -73,10 +73,13 @@ async function initializeDatabase() {
     WHERE deal_id IS NOT NULL;
 `;
 
-  // Enforce one active monitor per (pd_id, pair, phone)
+  // Enforce one active monitor per (pd_id, pair, phone, alert_or_order)
+  // This allows both an active alert AND an active order for the same pair
   const createPartialUnique = `
-    CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_monitor
-    ON rate_monitors (pd_id, sell_currency, buy_currency, phone)
+    DROP INDEX IF EXISTS uniq_active_monitor;
+    
+    CREATE UNIQUE INDEX uniq_active_monitor
+    ON rate_monitors (pd_id, sell_currency, buy_currency, phone, alert_or_order)
     WHERE status = 'active';
   `;
 
@@ -638,7 +641,7 @@ async function sendDueUpdates() {
   // due = active + Daily/Weekly + next_update_at reached
   const { rows: due } = await pool.query(
     `SELECT * FROM rate_monitors
-     WHERE status = 'active'
+     WHERE status = 'active' 
        AND update_frequency IN ('Daily','Weekly')
        AND next_update_at IS NOT NULL
        AND next_update_at <= NOW()`
@@ -1041,7 +1044,7 @@ app.post('/api/monitors', async (req, res) => {
                                      /uniq_active_monitor/i.test(error?.detail || ''))) {
       return res.status(409).json({
         error: 'duplicate_monitor',
-        message: 'You already have an active alert for this currency pair. Cancel it first or choose a different target.'
+        message: `You already have an active ${req.body.alert_or_order || 'monitor'} for this currency pair. Cancel it first or choose a different target.`
       });
     }
   
