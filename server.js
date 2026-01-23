@@ -491,8 +491,28 @@ class PipeDriveService {
       console.error('Error updating deal stage:', error.response?.data || error);
       throw error;
     }
-  }    
+  }
+  
+  // UPDATE DEAL (general purpose - for marking as lost, etc.)
+  async updateDeal(dealId, updates) {
+    try {
+      const response = await axios.put(
+        `${this.baseURL}/deals/${dealId}?api_token=${this.apiKey}`,
+        updates
+      );
+
+      if (VERBOSE) {
+        console.log('Deal updated:', response.data);
+      }
+
+      return response.data.data;
+    } catch (error) {
+      console.error(`Error updating deal ${dealId}:`, error.response?.data || error);
+      throw error;
+    }
+  }
 }
+
 
 const rateService = new RateService();
 const whatsappService = new WhatsAppService();
