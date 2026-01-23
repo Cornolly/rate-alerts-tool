@@ -858,6 +858,42 @@ app.get('/api/monitors', async (req, res) => {
   }
 });
 
+// Get monitors by phone number
+app.get('/api/monitors/by-phone', requireInternal, async (req, res) => {
+  try {
+    const { phone, status, alert_or_order } = req.query;
+    
+    if (!phone) {
+      return res.status(400).json({ error: 'phone parameter required' });
+    }
+
+    // Build the query dynamically based on provided parameters
+    let query = 'SELECT * FROM rate_monitors WHERE phone = $1';
+    const params = [phone];
+    let paramIndex = 2;
+
+    if (status) {
+      query += ` AND status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+
+    if (alert_or_order) {
+      query += ` AND alert_or_order = $${paramIndex}`;
+      params.push(alert_or_order);
+      paramIndex++;
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching monitors by phone:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/monitors', async (req, res) => {
   try {
     const {
