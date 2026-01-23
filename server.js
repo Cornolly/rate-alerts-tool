@@ -1194,8 +1194,8 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
 
     const updatedMonitor = updated[0];
 
-    // Update the deal in Pipedrive if this is an order with a deal_id
-    if (pre[0].alert_or_order === 'order' && pre[0].deal_id) {
+    // Update the deal in Pipedrive if this monitor has a deal_id
+    if (pre[0].deal_id) {
       try {
         await pipeDriveService.updateDeal(pre[0].deal_id, {
           '9ade4f4097884f9e1f8609aa317e2d8c91c1764f': finalClient // Target Rate field
@@ -1375,8 +1375,8 @@ app.patch('/api/monitors/:id/update-frequency', requireInternal, async (req, res
 
     const updatedMonitor = rows[0];
 
-    // Add note to deal in Pipedrive if this is an order with a deal_id
-    if (updatedMonitor.alert_or_order === 'order' && updatedMonitor.deal_id) {
+    // Add note to deal in Pipedrive if this monitor has a deal_id
+    if (updatedMonitor.deal_id) {
       try {
         await pipeDriveService.addDealNote(
           updatedMonitor.deal_id,
