@@ -1271,6 +1271,23 @@ app.patch('/api/monitors/:id/cancel', requireInternal, async (req, res) => {
     if (rowCount === 0) {
       return res.status(409).json({ error: 'not_active_or_missing' });
     }
+
+    const monitor = rows[0];
+
+    // If this was an order with a deal_id, mark the deal as lost in Pipedrive
+    if (monitor.alert_or_order === 'order' && monitor.deal_id) {
+      try {
+        await pipeDriveService.updateDeal(monitor.deal_id, {
+          status: 'lost',
+          lost_reason: 'Order cancelled by client'
+        });
+        console.log(`✅ Marked PD deal ${monitor.deal_id} as lost (order cancelled)`);
+      } catch (dealError) {
+        console.error(`❌ Failed to mark deal ${monitor.deal_id} as lost:`, dealError);
+        // Don't fail the cancellation if PD update fails
+      }
+    }
+
     return res.json(rows[0]);
   } catch (e) {
     console.error('cancel endpoint error', e);
