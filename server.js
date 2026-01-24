@@ -533,14 +533,16 @@ app.get('/api/rate/:from/:to', async (req, res) => {
 const limit = pLimit(5);
 
 // Optimized core monitoring function - grouped by currency pair, batched updates
-async function checkRates() {
+async function checkRates(skipWeekendCheck = false) {
   // Simple weekend skip (consider UTC market hours if needed)
-  const dow = new Date().getDay();
-  if (dow === 0 || dow === 6) {
-    console.log('Weekend detected - skipping rate check', new Date().toISOString());
-    return;
+  if (!skipWeekendCheck) {
+    const dow = new Date().getDay();
+    if (dow === 0 || dow === 6) {
+      console.log('Weekend detected - skipping rate check', new Date().toISOString());
+      return;
+    }
   }
-
+  
   console.log('Starting rate check...', new Date().toISOString());
 
   try {
@@ -1458,7 +1460,7 @@ app.delete('/api/monitors/:id', async (req, res) => {
 // Manual rate check trigger
 app.post('/api/check-rates', async (req, res) => {
   try {
-    await checkRates();
+    await checkRates(true);
     res.json({ message: 'Rate check triggered successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
