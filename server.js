@@ -1197,10 +1197,18 @@ app.patch('/api/monitors/:id/update-target', requireInternal, async (req, res) =
     // Update the deal in Pipedrive if this monitor has a deal_id
     if (pre[0].deal_id) {
       try {
+        // Update the target rate field
         await pipeDriveService.updateDeal(pre[0].deal_id, {
           '9ade4f4097884f9e1f8609aa317e2d8c91c1764f': finalClient // Target Rate field
         });
         console.log(`✅ Updated target rate in PD deal ${pre[0].deal_id}`);
+        
+        // Also add a note about the change
+        await pipeDriveService.addDealNote(
+          pre[0].deal_id,
+          `Client changed target rate to: ${finalClient.toFixed(4)}`
+        );
+        console.log(`✅ Added target rate update note to PD deal ${pre[0].deal_id}`);
       } catch (dealError) {
         console.error(`❌ Failed to update deal ${pre[0].deal_id}:`, dealError);
         // Don't fail the update if PD update fails
