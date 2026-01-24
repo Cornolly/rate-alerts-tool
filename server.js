@@ -595,10 +595,27 @@ async function checkRates() {
              RETURNING id, current_rate::float8 AS current_rate,
                        current_client_rate::float8 AS current_client_rate,
                        target_market_rate::float8 AS target_market_rate,
-                       trigger_direction, alert_or_order
+                       trigger_direction, alert_or_order, deal_id
             `,
             [currentRate, ids]
           );
+
+          // Update Live Rate in Pipedrive for all monitors with deal_id
+          for (const s of snaps) {
+            if (s.deal_id) {
+              try {
+                await pipeDriveService.updateDeal(s.deal_id, {
+                  '41eb3eacd066859fa687d999425a0cbf52710718': s.current_client_rate // Live Rate field
+                });
+                if (VERBOSE) {
+                  console.log(`✅ Updated live rate in PD deal ${s.deal_id}: ${s.current_client_rate.toFixed(4)}`);
+                }
+              } catch (dealError) {
+                console.error(`❌ Failed to update live rate in deal ${s.deal_id}:`, dealError.message);
+                // Don't fail the rate check if PD update fails
+              }
+            }
+          }
 
           // Decide triggers (can move into SQL if you prefer)
           for (const s of snaps) {
