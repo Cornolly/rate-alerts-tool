@@ -542,7 +542,7 @@ async function checkRates(skipWeekendCheck = false) {
       return;
     }
   }
-  
+
   console.log('Starting rate check...', new Date().toISOString());
 
   try {
@@ -1336,14 +1336,18 @@ app.patch('/api/monitors/:id/cancel', requireInternal, async (req, res) => {
 
     const monitor = rows[0];
 
-    // If this was an order with a deal_id, mark the deal as lost in Pipedrive
-    if (monitor.alert_or_order === 'order' && monitor.deal_id) {
+    // If this monitor has a deal_id, mark the deal as lost in Pipedrive
+    if (monitor.deal_id) {
       try {
+        const reason = monitor.alert_or_order === 'order' 
+          ? 'Order cancelled by client' 
+          : 'Alert cancelled by client';
+        
         await pipeDriveService.updateDeal(monitor.deal_id, {
           status: 'lost',
-          lost_reason: 'Order cancelled by client'
+          lost_reason: reason
         });
-        console.log(`✅ Marked PD deal ${monitor.deal_id} as lost (order cancelled)`);
+        console.log(`✅ Marked PD deal ${monitor.deal_id} as lost (${monitor.alert_or_order} cancelled)`);
       } catch (dealError) {
         console.error(`❌ Failed to mark deal ${monitor.deal_id} as lost:`, dealError);
         // Don't fail the cancellation if PD update fails
