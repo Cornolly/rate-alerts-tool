@@ -675,7 +675,6 @@ async function checkRates(skipWeekendCheck = false) {
   }
 }
 
-// <<< add this near checkRates() >>>
 async function sendDueUpdates() {
   // due = active + Daily/Weekly + next_update_at reached
   const { rows: due } = await pool.query(
@@ -701,11 +700,18 @@ async function sendDueUpdates() {
       [currentRate, monitor.id]
     );
 
-    // ✅ THIS is the line you asked about
-    await notifyQuoteUpdate(monitor, {
-      currentClientRate: Number(snap.current_client_rate),
-      period: monitor.update_frequency
-    });
+    // ✅ UPDATED: Send different notification based on alert_or_order type
+    if (monitor.alert_or_order === 'alert') {
+      await notifyQuoteUpdate(monitor, {
+        currentClientRate: Number(snap.current_client_rate),
+        period: monitor.update_frequency
+      });
+    } else if (monitor.alert_or_order === 'order') {
+      await notifyOrderUpdate(monitor, {
+        currentClientRate: Number(snap.current_client_rate),
+        period: monitor.update_frequency
+      });
+    }
 
     // bump next_update_at by 1 day or 7 days to keep the same time-of-day
     const bump = monitor.update_frequency === 'Weekly' ? '7 days' : '1 day';
@@ -1275,6 +1281,41 @@ async function notifyQuoteUpdate(monitor, { currentClientRate, period }) {
   }
 }
 
+// send the "order_update" (Daily/Weekly) template via Quote
+async function notifyOrderUpdate(monitor, { currentClientRate, period }) {
+  try {
+    if (!process.env.QUOTE_BASE_URL || !process.env.INTERNAL_SHARED_SECRET) return;
+    if (!monitor.phone) return;
+
+    const url = `${process.env.QUOTE_BASE_URL}/api/send-order-update`;
+    const payload = {
+      phone: monitor.phone,
+      sellCurrency: monitor.sell_currency,
+      buyCurrency: monitor.buy_currency,
+      targetClientRate: Number(monitor.target_client_rate),
+      currentClientRate: Number(currentClientRate),
+      // Quote expects "period": "daily" | "weekly"
+      period: (period || monitor.update_frequency || 'Daily')
+                .toString().toLowerCase().startsWith('week') ? 'weekly' : 'daily',
+      monitorId: String(monitor.id),
+      // Include amounts for orders
+      sellAmount: monitor.sell_amount ? Number(monitor.sell_amount) : null,
+      buyAmount: monitor.buy_amount ? Number(monitor.buy_amount) : null
+    };
+
+    if (VERBOSE) console.log('📤 POST to Quote (order_update)', { url, payload });
+    await axios.post(url, payload, {
+      headers: { 'x-internal-secret': process.env.INTERNAL_SHARED_SECRET },
+      timeout: 10000
+    });
+  } catch (e) {
+    console.error('❌ notifyOrderUpdate failed', {
+      status: e.response?.status,
+      data: e.response?.data,
+      message: e.message
+    });
+  }
+}
 
 // tell Quote to send the "alert_triggerd" template
 async function notifyQuoteTriggered(monitor, { currentRate, currentClientRate }) {
