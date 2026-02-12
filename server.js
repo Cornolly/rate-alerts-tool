@@ -892,7 +892,7 @@ function requireInternal(req, res, next) {
 }
 
 // Get all monitors
-app.get('/api/monitors', async (req, res) => {
+app.get('/api/monitors', requireInternal, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM rate_monitors ORDER BY created_at DESC'
@@ -939,7 +939,7 @@ app.get('/api/monitors/by-phone', requireInternal, async (req, res) => {
   }
 });
 
-app.post('/api/monitors', async (req, res) => {
+app.post('/api/monitors', requireInternal, async (req, res) => {
   try {
     const {
       pdId,
@@ -1470,7 +1470,7 @@ app.patch('/api/monitors/:id/update-frequency', requireInternal, async (req, res
 
 
 // Update monitor
-app.put('/api/monitors/:id', async (req, res) => {
+app.put('/api/monitors/:id', requireInternal, async (req, res) => {
   const { id } = req.params;
   const updates = req.body;
   
@@ -1493,7 +1493,7 @@ app.put('/api/monitors/:id', async (req, res) => {
 });
 
 // Delete monitor
-app.delete('/api/monitors/:id', async (req, res) => {
+app.delete('/api/monitors/:id', requireInternal, async (req, res) => {
   try {
     await pool.query('DELETE FROM rate_monitors WHERE id = $1', [req.params.id]);
     res.status(204).send();
@@ -1503,7 +1503,7 @@ app.delete('/api/monitors/:id', async (req, res) => {
 });
 
 // Manual rate check trigger
-app.post('/api/check-rates', async (req, res) => {
+app.post('/api/check-rates', requireInternal, async (req, res) => {
   try {
     await checkRates(true);
     res.json({ message: 'Rate check triggered successfully' });
@@ -1554,7 +1554,7 @@ app.get('/webhook/whatsapp', (req, res) => {
 
 
 // CTA endpoint used by Quote to send the Flow-enabled rate_alert template
-app.post('/api/send-rate-alert-cta', async (req, res) => {
+app.post('/api/send-rate-alert-cta', requireInternal, async (req, res) => {
   try {
     if (req.headers['x-internal-secret'] !== process.env.INTERNAL_SHARED_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
@@ -1616,7 +1616,7 @@ app.post('/api/send-rate-alert-cta', async (req, res) => {
 
 
 // Test endpoint to send rate_alert template with correct format
-app.post('/api/test-template/:phoneNumber', async (req, res) => {
+app.post('/api/test-template/:phoneNumber', requireInternal, async (req, res) => {
   try {
     const phoneNumber = req.params.phoneNumber;
     
@@ -1711,7 +1711,7 @@ app.post('/api/test-template/:phoneNumber', async (req, res) => {
 
 
 // Also add a simple test endpoint to verify WhatsApp connection
-app.post('/api/test-whatsapp-config', (req, res) => {
+app.post('/api/test-whatsapp-config', requireInternal, (req, res) => {
   const config = {
     hasApiKey: !!process.env.WHATSAPP_API_KEY,
     hasPhoneNumberId: !!process.env.WHATSAPP_PHONE_NUMBER_ID,
