@@ -22,6 +22,28 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// New code
+const pdLastUpdated = {}; // { deal_id: timestamp } - persists between rate checks
+function shouldUpdatePD(dealId, proximityPercent) {
+  const now = Date.now();
+  const last = pdLastUpdated[dealId] || 0;
+  const elapsed = now - last;
+
+  if (proximityPercent > 0.02) {
+    const ukNow = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+    const ukHour = ukNow.getHours();
+    const todayKey = `${dealId}_${ukNow.toDateString()}`;
+    if (ukHour === 8 && !pdLastUpdated[todayKey]) {
+      pdLastUpdated[todayKey] = true;
+      return true;
+    }
+    return false;
+  } else if (proximityPercent > 0.01) {
+    return elapsed >= 3 * 60 * 60 * 1000; // 3 hours
+  } else {
+    return elapsed >= 60 * 60 * 1000; // 1 hour
+  }
+}
 
 async function initializeDatabase() {
   const createTableAndIndexes = `
@@ -604,17 +626,21 @@ async function checkRates(skipWeekendCheck = false) {
 
           // Update Live Rate in Pipedrive for all monitors with deal_id
           for (const s of snaps) {
-            if (s.deal_id) {
-              try {
-                await pipeDriveService.updateDeal(s.deal_id, {
-                  '41eb3eacd066859fa687d999425a0cbf52710718': s.current_client_rate // Live Rate field
-                });
-                if (VERBOSE) {
-                  console.log(`✅ Updated live rate in PD deal ${s.deal_id}: ${s.current_client_rate.toFixed(4)}`);
+            if (s.deal_id && !process.env.DISABLE_PD_LIVE_RATE) {
+              const proximityPercent = Math.abs(s.current_rate - s.target_market_rate) / s.target_market_rate;
+              if (shouldUpdatePD(s.deal_id, proximityPercent)) {
+                try {
+                  await pipeDriveService.updateDeal(s.deal_id, {
+                    '41eb3eacd066859fa687d999425a0cbf52710718': s.current_client_rate // Live Rate field
+                  });
+                  pdLastUpdated[s.deal_id] = Date.now(); // record successful update time
+                  if (VERBOSE) {
+                    console.log(`✅ Updated live rate in PD deal ${s.deal_id}: ${s.current_client_rate.toFixed(4)}`);
+                  }
+                } catch (dealError) {
+                  console.error(`❌ Failed to update live rate in deal ${s.deal_id}:`, dealError.message);
+                  // Don't fail the rate check if PD update fails
                 }
-              } catch (dealError) {
-                console.error(`❌ Failed to update live rate in deal ${s.deal_id}:`, dealError.message);
-                // Don't fail the rate check if PD update fails
               }
             }
           }
