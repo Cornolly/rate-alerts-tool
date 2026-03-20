@@ -626,7 +626,7 @@ async function checkRates(skipWeekendCheck = false) {
 
           // Update Live Rate in Pipedrive for all monitors with deal_id
           for (const s of snaps) {
-            if (s.deal_id && !process.env.DISABLE_PD_LIVE_RATE) {
+            if (s.deal_id && process.env.DISABLE_PD_LIVE_RATE !== '1') {
               const proximityPercent = Math.abs(s.current_rate - s.target_market_rate) / s.target_market_rate;
               if (shouldUpdatePD(s.deal_id, proximityPercent)) {
                 try {
