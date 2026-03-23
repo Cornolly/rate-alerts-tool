@@ -779,6 +779,20 @@ async function sendDueUpdates() {
   }
 }
 
+async function checkChannelPairRates() {
+  for (const pair of CHANNEL_PAIRS) {
+    try {
+      const sell = pair.slice(0, 3);
+      const buy = pair.slice(3);
+      const rate = await rateService.getRate(sell, buy);
+      if (rate == null) continue;
+      console.log(`[channel_posts] ${pair}: ${rate}`);
+      await maybePostChannelUpdate(pair, rate);
+    } catch (err) {
+      console.error(`[channel_posts] Rate check error for ${pair}:`, err.message);
+    }
+  }
+}
 
 async function handleAlert(monitor, currentRate) {
   try {
@@ -952,6 +966,7 @@ async function fetchRecentChannelPosts(pair, limit = 6) {
     `SELECT posted_at, rate_at_post, change_pct, message_text, triggered_by
      FROM channel_posts
      WHERE pair = $1
+      AND triggered_by != 'open_snapshot'
      ORDER BY posted_at DESC
      LIMIT $2`,
     [pair, limit]
@@ -1229,12 +1244,29 @@ async function maybePostChannelUpdate(pair, currentRate) {
 }
  
 // Called at 07:30 UK time to reset the daily open rate for all tracked pairs
-function resetChannelOpenRates() {
-  for (const pair of Object.keys(channelState)) {
-    const current = channelState[pair];
-    if (current.openRate) {
-      console.log(`[channel_posts] Resetting open rate for ${pair} (was ${current.openRate})`);
-      channelState[pair] = { ...current, openRate: null }; // will be set on next rate check
+async function resetChannelOpenRates() {
+  for (const pair of CHANNEL_PAIRS) {
+    try {
+      const sell = pair.slice(0, 3);
+      const buy = pair.slice(3);
+      const rate = await rateService.getRate(sell, buy);
+      if (!rate) continue;
+
+      // Store as open snapshot for weekly/monthly lookback
+      await storeChannelPost({
+        pair,
+        rate,
+        prevRate: channelState[pair]?.openRate || rate,
+        changePct: 0,
+        messageText: `Open snapshot — no post generated`,
+        triggeredBy: 'open_snapshot'
+      });
+
+      // Reset open rate in memory
+      channelState[pair] = { ...(channelState[pair] || {}), openRate: rate };
+      console.log(`[channel_posts] Open snapshot stored for ${pair}: ${rate}`);
+    } catch (err) {
+      console.error(`[channel_posts] Open snapshot error for ${pair}:`, err.message);
     }
   }
 }
@@ -2521,7 +2553,10 @@ async function start() {
   scheduleNextCheck();          // now it's safe to start the cron logic
   cron.schedule('30 7 * * 1-5', () => {
     resetChannelOpenRates();
-  }, { timezone: 'Europe/London' }); // 👈 add this
+  }, { timezone: 'Europe/London' });
+  cron.schedule('*/15 * * * 1-5', () => {
+    checkChannelPairRates();
+  }, { timezone: 'Europe/London' });
   // (optional) run one immediate check:
   // await checkRates();
 
