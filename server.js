@@ -1075,7 +1075,7 @@ Write the update now.`;
     'https://api.anthropic.com/v1/messages',
     {
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
+      max_tokens: 2048,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }],
       tools: [{ type: 'web_search_20250305', name: 'web_search' }]
@@ -1092,7 +1092,7 @@ Write the update now.`;
  
   const textBlock = response.data.content.find(block => block.type === 'text');
   if (!textBlock) throw new Error('No text block in Claude response');
-  return textBlock.text.trim();
+  return textBlocks.map(b => b.text).join('').trim();
 }
  
 // --- Send draft to your WhatsApp ---
