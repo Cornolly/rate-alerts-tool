@@ -1056,7 +1056,9 @@ Rules:
 - Plain text only — no markdown bold (*text*), no bullet points
 - Do not invent specific data not provided to you`;
  
-  const userPrompt = `Write a WhatsApp channel update for ${pairDisplay}.
+const pairNote = PAIR_CONTEXT[pair] || '';
+
+const userPrompt = `Write a WhatsApp channel update for ${pairDisplay}.
  
 Current rate: ${rate}
 Today's date: ${today}
@@ -1128,7 +1130,7 @@ async function maybePostChannelUpdate(pair, currentRate) {
       if (VERBOSE) console.log(`[channel_posts] ${pair} not in whitelist, skipping`);
       return;
     }
-    
+
     const INTRADAY_THRESHOLD = parseFloat(process.env.CHANNEL_INTRADAY_THRESHOLD || '0.5') / 100;
     const WEEKLY_THRESHOLD   = parseFloat(process.env.CHANNEL_WEEKLY_THRESHOLD   || '1.5') / 100;
     const MONTHLY_THRESHOLD  = parseFloat(process.env.CHANNEL_MONTHLY_THRESHOLD  || '3.0') / 100;
