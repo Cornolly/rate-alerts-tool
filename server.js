@@ -1091,9 +1091,9 @@ Write the update now.`;
   );
  
   const textBlock = response.data.content.find(block => block.type === 'text');
-  if (!textBlock) throw new Error('No text block in Claude response');
-  return textBlocks.map(b => b.text).join('').trim();
-}
+    if (!textBlock) throw new Error('No text block in Claude response');
+    return textBlocks.map(b => b.text).join('').trim();
+  }
  
 // --- Send draft to your WhatsApp ---
  
