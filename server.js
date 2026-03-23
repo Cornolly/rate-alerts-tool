@@ -1,6 +1,18 @@
 // Rate Alerts & Market Orders Tool for Railway
 // This tool monitors currency rates and triggers WhatsApp alerts or creates deals
 
+const channelState = {};
+
+const CHANNEL_PAIRS = ['SARGBP', 'EURUSD', 'GBPEUR', 'GBPUSD', 'SAREUR', 'SARAUD'];
+
+const PAIR_CONTEXT = {
+  SARGBP: 'SAR is pegged to USD at 3.75, so GBP/SAR movements are entirely driven by GBP/USD. Focus commentary on UK and US macro factors — BoE policy, US Fed, UK economic data. Do not suggest SAR-specific drivers.',
+  SAREUR: 'SAR is pegged to USD at 3.75, so SAR/EUR movements are entirely driven by EUR/USD. Focus commentary on ECB policy, Eurozone economic data, and USD strength. Do not suggest SAR-specific drivers.',
+  SARAUD: 'SAR is pegged to USD at 3.75, so SAR/AUD movements are entirely driven by AUD/USD. Focus commentary on RBA policy, Australian economic data, and USD strength. Do not suggest SAR-specific drivers.',
+  GBPUSD: 'Focus on BoE vs Fed policy divergence, UK and US economic data releases.',
+  EURUSD: 'Focus on ECB vs Fed policy divergence, Eurozone and US economic data releases.',
+  GBPEUR: 'Focus on BoE vs ECB policy divergence and UK/EU economic data.',
+};
 
 const pLimit = require('p-limit');
 const express = require('express');
@@ -126,6 +138,20 @@ async function initializeDatabase() {
   UPDATE rate_monitors SET margin = 0.005 WHERE margin IS NULL;
   `;
 
+  const createChannelPostsTable = `
+  CREATE TABLE IF NOT EXISTS channel_posts (
+    id            SERIAL PRIMARY KEY,
+    pair          VARCHAR(20)    NOT NULL,
+    posted_at     TIMESTAMPTZ    DEFAULT NOW(),
+    rate_at_post  NUMERIC(12,6)  NOT NULL,
+    prev_rate     NUMERIC(12,6),
+    change_pct    NUMERIC(8,4),
+    message_text  TEXT           NOT NULL,
+    triggered_by  VARCHAR(50)    DEFAULT 'rate_move'
+  );
+  CREATE INDEX IF NOT EXISTS idx_channel_posts_pair
+    ON channel_posts (pair, posted_at DESC);
+  `;
 
   try {
     await pool.query(createTableAndIndexes);
@@ -134,6 +160,7 @@ async function initializeDatabase() {
     await pool.query(addMarginAndClientRate);
     await pool.query(addNextUpdateAt);
     await pool.query(addDealTracking);
+    await pool.query(createChannelPostsTable);
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -624,6 +651,8 @@ async function checkRates(skipWeekendCheck = false) {
             [currentRate, ids]
           );
 
+          await maybePostChannelUpdate(pairKey.replace('/', ''), currentRate); // 👈 add this
+
           // Update Live Rate in Pipedrive for all monitors with deal_id
           for (const s of snaps) {
             if (s.deal_id && process.env.DISABLE_PD_LIVE_RATE !== '1') {
@@ -916,6 +945,295 @@ function requireInternal(req, res, next) {
   }
   next();
 }
+
+
+async function fetchRecentChannelPosts(pair, limit = 6) {
+  const { rows } = await pool.query(
+    `SELECT posted_at, rate_at_post, change_pct, message_text, triggered_by
+     FROM channel_posts
+     WHERE pair = $1
+     ORDER BY posted_at DESC
+     LIMIT $2`,
+    [pair, limit]
+  );
+  return rows.reverse(); // chronological order for the prompt
+}
+ 
+async function storeChannelPost({ pair, rate, prevRate, changePct, messageText, triggeredBy }) {
+  await pool.query(
+    `INSERT INTO channel_posts (pair, rate_at_post, prev_rate, change_pct, message_text, triggered_by)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [pair, rate, prevRate, parseFloat(changePct).toFixed(4), messageText, triggeredBy]
+  );
+}
+ 
+// Fetch the rate from N days ago using stored channel_posts data as a proxy,
+// or fall back to current rate (meaning 0% change) if no history exists.
+// For a proper solution you could store an ohlc_snapshots table instead.
+async function getRateNDaysAgo(pair, days) {
+  const { rows } = await pool.query(
+    `SELECT rate_at_post FROM channel_posts
+     WHERE pair = $1
+       AND posted_at >= NOW() - INTERVAL '${days} days' - INTERVAL '4 hours'
+       AND posted_at <= NOW() - INTERVAL '${days} days' + INTERVAL '4 hours'
+     ORDER BY ABS(EXTRACT(EPOCH FROM (posted_at - (NOW() - INTERVAL '${days} days'))))
+     LIMIT 1`,
+    [pair]
+  );
+  return rows.length ? parseFloat(rows[0].rate_at_post) : null;
+}
+ 
+// --- Claude generation ---
+ 
+function formatRecentPosts(rows) {
+  if (!rows.length) return 'No previous posts — this is the first update for this pair.';
+  return rows.map(r => {
+    const date = new Date(r.posted_at).toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'short', year: 'numeric'
+    });
+    const chg = r.change_pct != null
+      ? ` | ${Number(r.change_pct) >= 0 ? '+' : ''}${Number(r.change_pct).toFixed(2)}%`
+      : '';
+    return `[${date} | Rate: ${r.rate_at_post}${chg} | trigger: ${r.triggered_by}]\n${r.message_text}`;
+  }).join('\n\n---\n\n');
+}
+ 
+async function generateChannelPostText({
+  pair,
+  rate,
+  triggeredBy,       // 'intraday' | 'weekly' | 'monthly'
+  intradayChangePct, // % vs today's open (always provided)
+  weeklyChangePct,   // % vs 7d ago (null if not available)
+  monthlyChangePct,  // % vs 30d ago (null if not available)
+  recentPosts
+}) {
+  const pairDisplay = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+  const today = new Date().toLocaleDateString('en-GB', {
+    day: 'numeric', month: 'long', year: 'numeric'
+  });
+ 
+  // Build context string describing what triggered and what's nearby
+  const INTRADAY_THRESHOLD = parseFloat(process.env.CHANNEL_INTRADAY_THRESHOLD || '0.5');
+  const WEEKLY_THRESHOLD   = parseFloat(process.env.CHANNEL_WEEKLY_THRESHOLD   || '1.5');
+  const MONTHLY_THRESHOLD  = parseFloat(process.env.CHANNEL_MONTHLY_THRESHOLD  || '3.0');
+ 
+  let triggerContext = '';
+  if (triggeredBy === 'monthly') {
+    triggerContext = `This post is triggered by a significant monthly move of ${monthlyChangePct >= 0 ? '+' : ''}${monthlyChangePct.toFixed(2)}% over the past 30 days.`;
+  } else if (triggeredBy === 'weekly') {
+    triggerContext = `This post is triggered by a weekly move of ${weeklyChangePct >= 0 ? '+' : ''}${weeklyChangePct.toFixed(2)}% over the past 7 days.`;
+    if (monthlyChangePct != null) {
+      triggerContext += ` For context, the 30-day move is ${monthlyChangePct >= 0 ? '+' : ''}${monthlyChangePct.toFixed(2)}% (monthly threshold is ${MONTHLY_THRESHOLD}%).`;
+    }
+  } else {
+    // intraday
+    triggerContext = `This post is triggered by an intraday move of ${intradayChangePct >= 0 ? '+' : ''}${intradayChangePct.toFixed(2)}% vs today's open.`;
+    if (weeklyChangePct != null) {
+      const weeklyPct = weeklyChangePct.toFixed(2);
+      const weeklyProximity = Math.abs(weeklyChangePct) / WEEKLY_THRESHOLD * 100;
+      triggerContext += ` The 7-day move is ${weeklyChangePct >= 0 ? '+' : ''}${weeklyPct}% (${weeklyProximity.toFixed(0)}% of the way to the ${WEEKLY_THRESHOLD}% weekly threshold).`;
+    }
+    if (monthlyChangePct != null) {
+      const monthlyPct = monthlyChangePct.toFixed(2);
+      const monthlyProximity = Math.abs(monthlyChangePct) / MONTHLY_THRESHOLD * 100;
+      triggerContext += ` The 30-day move is ${monthlyChangePct >= 0 ? '+' : ''}${monthlyPct}% (${monthlyProximity.toFixed(0)}% of the way to the ${MONTHLY_THRESHOLD}% monthly threshold).`;
+    }
+  }
+ 
+  const systemPrompt = `You write WhatsApp channel updates for SummitFX, a UK foreign exchange broker.
+Updates are read by clients and prospects interested in currency movements.
+Keep posts informative, concise and practical.
+ 
+Rules:
+- 3–5 short paragraphs maximum
+- Lead with the current rate and direction
+- Briefly explain the key driver(s) where known
+- Include a "so what" — who benefits from the current rate
+- If weekly or monthly context is provided and meaningful, weave it in naturally — e.g. "building on a strong week" or "part of a broader trend over the past month". Do not force it if it doesn't add to the narrative.
+- End with a soft call to action (e.g. speak to us about locking in a rate)
+- Use emoji sparingly — flag emojis for currencies, one arrow for direction
+- Vary tone and angle — do not repeat the same framing as recent posts
+- Plain text only — no markdown bold (*text*), no bullet points
+- Do not invent specific data not provided to you`;
+ 
+  const userPrompt = `Write a WhatsApp channel update for ${pairDisplay}.
+ 
+Current rate: ${rate}
+Today's date: ${today}
+ 
+${pairNote ? `Pair context: ${pairNote}\n` : ''}Rate context:
+${triggerContext}
+ 
+Recent posts for this pair (vary your angle — do not repeat these framings):
+${formatRecentPosts(recentPosts)}
+ 
+Write the update now.`;
+ 
+  const response = await axios.post(
+    'https://api.anthropic.com/v1/messages',
+    {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 600,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }]
+    },
+    {
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      timeout: 30000
+    }
+  );
+ 
+  return response.data.content[0].text.trim();
+}
+ 
+// --- Send draft to your WhatsApp ---
+ 
+async function sendChannelDraftToNick({ pair, messageText, triggeredBy, intradayChangePct, weeklyChangePct, monthlyChangePct, rate }) {
+  const yourNumber = process.env.CHANNEL_POST_PHONE;
+  if (!yourNumber) {
+    console.error('[channel_posts] CHANNEL_POST_PHONE not set');
+    return;
+  }
+ 
+  const pairDisplay = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+ 
+  // Build a compact stats line for the header
+  const stats = [
+    `Intraday: ${intradayChangePct >= 0 ? '+' : ''}${intradayChangePct.toFixed(2)}%`,
+    weeklyChangePct  != null ? `7d: ${weeklyChangePct  >= 0 ? '+' : ''}${weeklyChangePct.toFixed(2)}%`  : null,
+    monthlyChangePct != null ? `30d: ${monthlyChangePct >= 0 ? '+' : ''}${monthlyChangePct.toFixed(2)}%` : null,
+  ].filter(Boolean).join(' | ');
+ 
+  const wrapper = `📋 Channel post draft — ${pairDisplay}\nRate: ${rate} | ${stats} | trigger: ${triggeredBy}\n\n${messageText}`;
+ 
+  await whatsappService.sendMessage(yourNumber, {
+    messaging_product: 'whatsapp',
+    to: yourNumber,
+    type: 'text',
+    text: { body: wrapper }
+  });
+ 
+  console.log(`[channel_posts] Draft sent to ${yourNumber} for ${pairDisplay} (trigger: ${triggeredBy})`);
+}
+ 
+// --- Main pipeline ---
+ 
+async function maybePostChannelUpdate(pair, currentRate) {
+  try {
+    if (!CHANNEL_PAIRS.includes(pair)) {
+      if (VERBOSE) console.log(`[channel_posts] ${pair} not in whitelist, skipping`);
+      return;
+    }
+    
+    const INTRADAY_THRESHOLD = parseFloat(process.env.CHANNEL_INTRADAY_THRESHOLD || '0.5') / 100;
+    const WEEKLY_THRESHOLD   = parseFloat(process.env.CHANNEL_WEEKLY_THRESHOLD   || '1.5') / 100;
+    const MONTHLY_THRESHOLD  = parseFloat(process.env.CHANNEL_MONTHLY_THRESHOLD  || '3.0') / 100;
+    const COOLDOWN_MINUTES   = parseInt(process.env.CHANNEL_COOLDOWN_MINUTES     || '120', 10);
+ 
+    const state = channelState[pair] || {};
+ 
+    // Cooldown check — never post more than once per COOLDOWN_MINUTES per pair
+    if (state.lastPostedAt) {
+      const minutesSinceLast = (Date.now() - state.lastPostedAt) / 60000;
+      if (minutesSinceLast < COOLDOWN_MINUTES) {
+        if (VERBOSE) console.log(`[channel_posts] ${pair} in cooldown (${minutesSinceLast.toFixed(0)}m < ${COOLDOWN_MINUTES}m)`);
+        return;
+      }
+    }
+ 
+    // If no open rate recorded yet, just store and return
+    if (!state.openRate) {
+      channelState[pair] = { ...state, openRate: currentRate, lastPostedRate: currentRate };
+      if (VERBOSE) console.log(`[channel_posts] ${pair} — first seen, storing open rate ${currentRate}`);
+      return;
+    }
+ 
+    // Calculate intraday move vs open
+    const intradayChangePct = ((currentRate - state.openRate) / state.openRate) * 100;
+ 
+    // Calculate weekly and monthly moves (from DB history)
+    const rate7dAgo  = await getRateNDaysAgo(pair, 7);
+    const rate30dAgo = await getRateNDaysAgo(pair, 30);
+    const weeklyChangePct  = rate7dAgo  != null ? ((currentRate - rate7dAgo)  / rate7dAgo)  * 100 : null;
+    const monthlyChangePct = rate30dAgo != null ? ((currentRate - rate30dAgo) / rate30dAgo) * 100 : null;
+ 
+    // Determine which threshold triggered, in priority order: monthly > weekly > intraday
+    // (higher timeframe wins if multiple cross simultaneously, but in practice
+    //  each fires independently on its own check cycle)
+    let triggeredBy = null;
+ 
+    if (monthlyChangePct != null && Math.abs(monthlyChangePct) >= MONTHLY_THRESHOLD * 100) {
+      triggeredBy = 'monthly';
+    } else if (weeklyChangePct != null && Math.abs(weeklyChangePct) >= WEEKLY_THRESHOLD * 100) {
+      triggeredBy = 'weekly';
+    } else if (Math.abs(intradayChangePct) >= INTRADAY_THRESHOLD * 100) {
+      triggeredBy = 'intraday';
+    }
+ 
+    if (!triggeredBy) {
+      if (VERBOSE) console.log(`[channel_posts] ${pair} — no threshold crossed (intraday: ${intradayChangePct.toFixed(2)}%)`);
+      return;
+    }
+ 
+    console.log(`[channel_posts] ${pair} — ${triggeredBy} threshold crossed, generating post`);
+ 
+    // Generate post
+    const recentPosts = await fetchRecentChannelPosts(pair, 6);
+    const messageText = await generateChannelPostText({
+      pair,
+      rate: currentRate,
+      triggeredBy,
+      intradayChangePct,
+      weeklyChangePct,
+      monthlyChangePct,
+      recentPosts
+    });
+ 
+    // Send draft to Nick
+    await sendChannelDraftToNick({
+      pair, messageText, triggeredBy,
+      intradayChangePct, weeklyChangePct, monthlyChangePct,
+      rate: currentRate
+    });
+ 
+    // Store in DB
+    const prevRate = state.lastPostedRate || state.openRate;
+    await storeChannelPost({
+      pair,
+      rate: currentRate,
+      prevRate,
+      changePct: intradayChangePct,
+      messageText,
+      triggeredBy
+    });
+ 
+    // Update state
+    channelState[pair] = {
+      ...state,
+      lastPostedRate: currentRate,
+      lastPostedAt: Date.now()
+    };
+ 
+  } catch (err) {
+    console.error(`[channel_posts] Error for ${pair}:`, err.message);
+  }
+}
+ 
+// Called at 07:30 UK time to reset the daily open rate for all tracked pairs
+function resetChannelOpenRates() {
+  for (const pair of Object.keys(channelState)) {
+    const current = channelState[pair];
+    if (current.openRate) {
+      console.log(`[channel_posts] Resetting open rate for ${pair} (was ${current.openRate})`);
+      channelState[pair] = { ...current, openRate: null }; // will be set on next rate check
+    }
+  }
+}
+
 
 // Get all monitors
 app.get('/api/monitors', requireInternal, async (req, res) => {
@@ -2129,6 +2447,61 @@ function scheduleNextCheck() {
     });
 }
 
+app.post('/api/channel-post', requireInternal, async (req, res) => {
+  const { pair, rate, marketContext } = req.body || {};
+ 
+  if (!pair || !rate) {
+    return res.status(400).json({ error: 'pair and rate are required' });
+  }
+ 
+  const pairUpper = pair.toUpperCase().replace('/', '');
+ 
+  // Force a post regardless of thresholds — useful for manual commentary
+  try {
+    const state = channelState[pairUpper] || {};
+    const openRate = state.openRate || parseFloat(rate);
+    const intradayChangePct = ((parseFloat(rate) - openRate) / openRate) * 100;
+ 
+    const rate7dAgo  = await getRateNDaysAgo(pairUpper, 7);
+    const rate30dAgo = await getRateNDaysAgo(pairUpper, 30);
+    const weeklyChangePct  = rate7dAgo  != null ? ((parseFloat(rate) - rate7dAgo)  / rate7dAgo)  * 100 : null;
+    const monthlyChangePct = rate30dAgo != null ? ((parseFloat(rate) - rate30dAgo) / rate30dAgo) * 100 : null;
+ 
+    const recentPosts = await fetchRecentChannelPosts(pairUpper, 6);
+    const messageText = await generateChannelPostText({
+      pair: pairUpper,
+      rate: parseFloat(rate),
+      triggeredBy: 'manual',
+      intradayChangePct,
+      weeklyChangePct,
+      monthlyChangePct,
+      recentPosts
+    });
+ 
+    await sendChannelDraftToNick({
+      pair: pairUpper, messageText, triggeredBy: 'manual',
+      intradayChangePct, weeklyChangePct, monthlyChangePct,
+      rate: parseFloat(rate)
+    });
+ 
+    await storeChannelPost({
+      pair: pairUpper,
+      rate: parseFloat(rate),
+      prevRate: state.lastPostedRate || openRate,
+      changePct: intradayChangePct,
+      messageText,
+      triggeredBy: 'manual'
+    });
+ 
+    channelState[pairUpper] = { ...state, lastPostedRate: parseFloat(rate), lastPostedAt: Date.now() };
+ 
+    res.json({ ok: true, pair: pairUpper, rate, messageText });
+  } catch (err) {
+    console.error('[channel_posts] Manual trigger error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 async function checkRatesAndReschedule() {
   await checkRates();
@@ -2141,6 +2514,9 @@ async function checkRatesAndReschedule() {
 async function start() {
   await initializeDatabase();   // make sure tables/columns/indexes exist
   scheduleNextCheck();          // now it's safe to start the cron logic
+  cron.schedule('30 7 * * 1-5', () => {
+    resetChannelOpenRates();
+  }, { timezone: 'Europe/London' }); // 👈 add this
   // (optional) run one immediate check:
   // await checkRates();
 
