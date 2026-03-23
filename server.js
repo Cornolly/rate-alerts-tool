@@ -1065,7 +1065,7 @@ Today's date: ${today}
  
 ${pairNote ? `Pair context: ${pairNote}\n` : ''}Rate context:
 ${triggerContext}
- 
+
 Recent posts for this pair (vary your angle — do not repeat these framings):
 ${formatRecentPosts(recentPosts)}
  
@@ -1075,9 +1075,10 @@ Write the update now.`;
     'https://api.anthropic.com/v1/messages',
     {
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 600,
+      max_tokens: 1024,
       system: systemPrompt,
-      messages: [{ role: 'user', content: userPrompt }]
+      messages: [{ role: 'user', content: userPrompt }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }]
     },
     {
       headers: {
@@ -1085,11 +1086,13 @@ Write the update now.`;
         'anthropic-version': '2023-06-01',
         'content-type': 'application/json'
       },
-      timeout: 30000
+      timeout: 60000
     }
   );
  
-  return response.data.content[0].text.trim();
+  const textBlock = response.data.content.find(block => block.type === 'text');
+  if (!textBlock) throw new Error('No text block in Claude response');
+  return textBlock.text.trim();
 }
  
 // --- Send draft to your WhatsApp ---
