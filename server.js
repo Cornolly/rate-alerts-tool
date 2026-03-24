@@ -2,13 +2,14 @@
 // This tool monitors currency rates and triggers WhatsApp alerts or creates deals
 
 const channelState = {};
+const channelPostLocks = {};
 
 const CHANNEL_PAIRS = ['SARGBP', 'EURUSD', 'GBPEUR', 'GBPUSD', 'SAREUR', 'SARAUD'];
 
 const PAIR_CONTEXT = {
-  SARGBP: 'SAR is pegged to USD at 3.75, so GBP/SAR movements are entirely driven by GBP/USD. Focus commentary on UK and US macro factors — BoE policy, US Fed, UK economic data. Do not suggest SAR-specific drivers.',
-  SAREUR: 'SAR is pegged to USD at 3.75, so SAR/EUR movements are entirely driven by EUR/USD. Focus commentary on ECB policy, Eurozone economic data, and USD strength. Do not suggest SAR-specific drivers.',
-  SARAUD: 'SAR is pegged to USD at 3.75, so SAR/AUD movements are entirely driven by AUD/USD. Focus commentary on RBA policy, Australian economic data, and USD strength. Do not suggest SAR-specific drivers.',
+  SARGBP: 'SAR is pegged to USD at 3.75, so SAR/GBP movements are entirely driven by GBP/USD. If SAR/GBP rises, GBP is WEAKENING vs USD (one SAR buys more GBP). If SAR/GBP falls, GBP is STRENGTHENING vs USD. Focus commentary on UK and US macro factors — BoE policy, US Fed, UK economic data. Do not suggest SAR-specific drivers.',
+  SAREUR: 'SAR is pegged to USD at 3.75, so SAR/EUR movements are entirely driven by EUR/USD. If SAR/EUR rises, EUR is WEAKENING vs USD. If SAR/EUR falls, EUR is STRENGTHENING vs USD. Focus commentary on ECB policy, Eurozone economic data, and USD strength. Do not suggest SAR-specific drivers.',
+  SARAUD: 'SAR is pegged to USD at 3.75, so SAR/AUD movements are entirely driven by AUD/USD. If SAR/AUD rises, AUD is WEAKENING vs USD. If SAR/AUD falls, AUD is STRENGTHENING vs USD. Focus commentary on RBA policy, Australian economic data, and USD strength. Do not suggest SAR-specific drivers.',
   GBPUSD: 'Focus on BoE vs Fed policy divergence, UK and US economic data releases.',
   EURUSD: 'Focus on ECB vs Fed policy divergence, Eurozone and US economic data releases.',
   GBPEUR: 'Focus on BoE vs ECB policy divergence and UK/EU economic data.',
@@ -1061,15 +1062,15 @@ Keep posts informative, concise and practical.
  
 Rules:
 - 3–5 short paragraphs maximum
-- Lead with the current rate and direction
-- Briefly explain the key driver(s) where known
+- Lead with the current rate and direction, being precise about what direction means for each currency
+- Prioritise the most recent news from the last hour as the primary driver — this is what's moving the market right now
+- If there is no clear recent catalyst, frame within the broader context (central bank policy, geopolitical developments, longer term trend)
+- Do not invent specific data points like oil prices or inflation figures — only use figures returned by web search
 - Include a "so what" — who benefits from the current rate
-- If weekly or monthly context is provided and meaningful, weave it in naturally — e.g. "building on a strong week" or "part of a broader trend over the past month". Do not force it if it doesn't add to the narrative.
+- If weekly or monthly context is provided and meaningful, weave it in naturally. Do not force it if it doesn't add to the narrative
 - End with a soft call to action (e.g. speak to us about locking in a rate)
 - Use emoji sparingly — flag emojis for currencies, one arrow for direction
-- Vary tone and angle — do not repeat the same framing as recent posts
-- Plain text only — no markdown bold (*text*), no bullet points
-- Do not invent specific data not provided to you`;
+- Vary tone and angle — do not repeat the same framing as recent posts`;
  
 const pairNote = PAIR_CONTEXT[pair] || '';
 
@@ -1149,13 +1150,19 @@ async function maybePostChannelUpdate(pair, currentRate) {
       return;
     }
 
+    if (channelPostLocks[pair]) {
+      if (VERBOSE) console.log(`[channel_posts] ${pair} already processing, skipping`);
+      return;
+    }
+    channelPostLocks[pair] = true;
+
     const INTRADAY_THRESHOLD = parseFloat(process.env.CHANNEL_INTRADAY_THRESHOLD || '0.5') / 100;
     const WEEKLY_THRESHOLD   = parseFloat(process.env.CHANNEL_WEEKLY_THRESHOLD   || '1.5') / 100;
     const MONTHLY_THRESHOLD  = parseFloat(process.env.CHANNEL_MONTHLY_THRESHOLD  || '3.0') / 100;
     const COOLDOWN_MINUTES   = parseInt(process.env.CHANNEL_COOLDOWN_MINUTES     || '120', 10);
- 
+
     const state = channelState[pair] || {};
- 
+
     // Cooldown check — never post more than once per COOLDOWN_MINUTES per pair
     if (state.lastPostedAt) {
       const minutesSinceLast = (Date.now() - state.lastPostedAt) / 60000;
@@ -1164,43 +1171,43 @@ async function maybePostChannelUpdate(pair, currentRate) {
         return;
       }
     }
- 
+
     // If no open rate recorded yet, just store and return
     if (!state.openRate) {
       channelState[pair] = { ...state, openRate: currentRate, lastPostedRate: currentRate };
       if (VERBOSE) console.log(`[channel_posts] ${pair} — first seen, storing open rate ${currentRate}`);
       return;
     }
- 
-    // Calculate intraday move vs open
+
+    // Calculate intraday move vs open, and move since last post
+    const referenceRate = state.lastPostedRate || state.openRate;
     const intradayChangePct = ((currentRate - state.openRate) / state.openRate) * 100;
- 
+    const moveSinceLastPost = ((currentRate - referenceRate) / referenceRate) * 100;
+
     // Calculate weekly and monthly moves (from DB history)
     const rate7dAgo  = await getRateNDaysAgo(pair, 7);
     const rate30dAgo = await getRateNDaysAgo(pair, 30);
     const weeklyChangePct  = rate7dAgo  != null ? ((currentRate - rate7dAgo)  / rate7dAgo)  * 100 : null;
     const monthlyChangePct = rate30dAgo != null ? ((currentRate - rate30dAgo) / rate30dAgo) * 100 : null;
- 
+
     // Determine which threshold triggered, in priority order: monthly > weekly > intraday
-    // (higher timeframe wins if multiple cross simultaneously, but in practice
-    //  each fires independently on its own check cycle)
     let triggeredBy = null;
- 
+
     if (monthlyChangePct != null && Math.abs(monthlyChangePct) >= MONTHLY_THRESHOLD * 100) {
       triggeredBy = 'monthly';
     } else if (weeklyChangePct != null && Math.abs(weeklyChangePct) >= WEEKLY_THRESHOLD * 100) {
       triggeredBy = 'weekly';
-    } else if (Math.abs(intradayChangePct) >= INTRADAY_THRESHOLD * 100) {
+    } else if (Math.abs(moveSinceLastPost) >= INTRADAY_THRESHOLD * 100) {
       triggeredBy = 'intraday';
     }
- 
+
     if (!triggeredBy) {
       if (VERBOSE) console.log(`[channel_posts] ${pair} — no threshold crossed (intraday: ${intradayChangePct.toFixed(2)}%)`);
       return;
     }
- 
+
     console.log(`[channel_posts] ${pair} — ${triggeredBy} threshold crossed, generating post`);
- 
+
     // Generate post
     const recentPosts = await fetchRecentChannelPosts(pair, 6);
     const messageText = await generateChannelPostText({
@@ -1212,14 +1219,14 @@ async function maybePostChannelUpdate(pair, currentRate) {
       monthlyChangePct,
       recentPosts
     });
- 
+
     // Send draft to Nick
     await sendChannelDraftToNick({
       pair, messageText, triggeredBy,
       intradayChangePct, weeklyChangePct, monthlyChangePct,
       rate: currentRate
     });
- 
+
     // Store in DB
     const prevRate = state.lastPostedRate || state.openRate;
     await storeChannelPost({
@@ -1230,16 +1237,18 @@ async function maybePostChannelUpdate(pair, currentRate) {
       messageText,
       triggeredBy
     });
- 
+
     // Update state
     channelState[pair] = {
       ...state,
       lastPostedRate: currentRate,
       lastPostedAt: Date.now()
     };
- 
+
   } catch (err) {
     console.error(`[channel_posts] Error for ${pair}:`, err.message);
+  } finally {
+    channelPostLocks[pair] = false;
   }
 }
  
