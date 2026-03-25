@@ -1174,7 +1174,7 @@ async function maybePostChannelUpdate(pair, currentRate) {
 
     // If no open rate recorded yet, just store and return
     if (!state.openRate) {
-      channelState[pair] = { ...state, openRate: currentRate, lastPostedRate: currentRate };
+      channelState[pair] = { ...state, openRate: currentRate};
       if (VERBOSE) console.log(`[channel_posts] ${pair} — first seen, storing open rate ${currentRate}`);
       return;
     }
@@ -1272,7 +1272,7 @@ async function resetChannelOpenRates() {
       });
 
       // Reset open rate in memory
-      channelState[pair] = { ...(channelState[pair] || {}), openRate: rate };
+      channelState[pair] = { ...(channelState[pair] || {}), openRate: rate, lastPostedRate: null };
       console.log(`[channel_posts] Open snapshot stored for ${pair}: ${rate}`);
     } catch (err) {
       console.error(`[channel_posts] Open snapshot error for ${pair}:`, err.message);
