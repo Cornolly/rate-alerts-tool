@@ -781,6 +781,7 @@ async function sendDueUpdates() {
 }
 
 async function checkChannelPairRates() {
+  if (process.env.CHANNEL_POSTS_ENABLED !== 'true') return;
   for (const pair of CHANNEL_PAIRS) {
     try {
       const sell = pair.slice(0, 3);
@@ -1147,6 +1148,11 @@ async function maybePostChannelUpdate(pair, currentRate) {
   try {
     if (!CHANNEL_PAIRS.includes(pair)) {
       if (VERBOSE) console.log(`[channel_posts] ${pair} not in whitelist, skipping`);
+      return;
+    }
+
+    if (process.env.CHANNEL_POSTS_ENABLED !== 'true') {
+      if (VERBOSE) console.log(`[channel_posts] disabled via env var`);
       return;
     }
 
