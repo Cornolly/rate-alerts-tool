@@ -279,10 +279,9 @@ function pairFromCache(cachedRow, from, to) {
   return fromR && toR ? toR / fromR : null;
 }
 
-// Capture the day's "close" — run once per UK weekday at 22:00
 async function captureDailyClose() {
-  const uk = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
-  const tradingDay = uk.toISOString().slice(0, 10); // YYYY-MM-DD
+  // Get the current date in the UK timezone, formatted as YYYY-MM-DD
+  const tradingDay = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
 
   const cached = await getCachedRates();
   if (!cached) {
@@ -303,8 +302,7 @@ async function captureDailyClose() {
 
 // Get most recent daily close (strictly before today)
 async function getPreviousDailyClose() {
-  const uk = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
-  const today = uk.toISOString().slice(0, 10);
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
   const { rows } = await pool.query(
     `SELECT trading_day, base, rates
        FROM fx_daily_close
