@@ -711,26 +711,6 @@ app.get('/public/ticker-rates', async (req, res) => {
   }
 });
 
-// TEMP: Debug endpoint — remove after fixing ticker
-app.get('/public/debug-rates', async (req, res) => {
-  try {
-    const cached = await getCachedRates();
-    res.json({
-      has_cached: !!cached,
-      rates_type: typeof cached?.rates,
-      rates_sample: typeof cached?.rates === 'string'
-        ? cached.rates.slice(0, 100) + '...'
-        : Object.keys(cached?.rates || {}).slice(0, 5),
-      gbp_value: cached?.rates?.GBP,
-      oxr_timestamp: cached?.oxr_timestamp,
-      oxr_timestamp_type: typeof cached?.oxr_timestamp,
-      ts: cached?.ts,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, stack: err.stack });
-  }
-});
-
 // Get current rate for a currency pair
 app.get('/api/rate/:from/:to', async (req, res) => {
   try {
