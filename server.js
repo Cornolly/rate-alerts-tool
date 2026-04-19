@@ -154,6 +154,29 @@ async function initializeDatabase() {
     ON channel_posts (pair, posted_at DESC);
   `;
 
+  const createFxTables = `
+  CREATE TABLE IF NOT EXISTS fx_rates (
+    id            BIGSERIAL PRIMARY KEY,
+    ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    base          VARCHAR(3) NOT NULL DEFAULT 'USD',
+    rates         JSONB NOT NULL,
+    oxr_timestamp BIGINT NOT NULL,
+    source        VARCHAR(20) NOT NULL DEFAULT 'oxr'
+  );
+  CREATE INDEX IF NOT EXISTS idx_fx_rates_ts ON fx_rates (ts DESC);
+  CREATE INDEX IF NOT EXISTS idx_fx_rates_oxr_ts ON fx_rates (oxr_timestamp DESC);
+
+  CREATE TABLE IF NOT EXISTS fx_daily_close (
+    id             BIGSERIAL PRIMARY KEY,
+    trading_day    DATE NOT NULL,
+    base           VARCHAR(3) NOT NULL DEFAULT 'USD',
+    rates          JSONB NOT NULL,
+    captured_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (trading_day, base)
+  );
+  CREATE INDEX IF NOT EXISTS idx_fx_daily_close_day ON fx_daily_close (trading_day DESC);
+  `;
+
   try {
     await pool.query(createTableAndIndexes);
     await pool.query(alterTable);
@@ -162,6 +185,7 @@ async function initializeDatabase() {
     await pool.query(addNextUpdateAt);
     await pool.query(addDealTracking);
     await pool.query(createChannelPostsTable);
+    await pool.query(createFxTables); 
     console.log('Database initialized successfully');
   } catch (error) {
     console.error('Database initialization error:', error);
@@ -186,6 +210,111 @@ function normalizePhone(input) {
   return cc ? `+${cc}${digits}` : `+${digits}`;
 }
 
+// ─────────────────────────────────────────────
+// FX rate polling + caching
+// ─────────────────────────────────────────────
+
+const POLL_INTERVAL_MS = 60 * 1000; // 1 minute — adjust when you confirm VIP tier
+
+function isFxMarketClosed() {
+  const uk = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+  const day = uk.getDay();   // 0 = Sun, 5 = Fri, 6 = Sat
+  const hour = uk.getHours();
+  if (day === 6) return true;                   // all Saturday
+  if (day === 5 && hour >= 22) return true;     // Friday after 22:00 UK
+  if (day === 0 && hour < 22) return true;      // Sunday before 22:00 UK
+  return false;
+}
+
+// Poll OXR once, dedupe on their timestamp, insert if new
+async function pollAndStoreRates() {
+  if (isFxMarketClosed()) return;
+  try {
+    const res = await axios.get(
+      `https://openexchangerates.org/api/latest.json?app_id=${process.env.OPENEXCHANGERATES_API_KEY}`,
+      { timeout: 5000 }
+    );
+    const { base, rates, timestamp: oxrTs } = res.data;
+    if (!rates || !oxrTs) return;
+
+    // Dedup — only write if OXR's own timestamp is newer than our latest row
+    const { rows } = await pool.query(
+      'SELECT oxr_timestamp FROM fx_rates ORDER BY id DESC LIMIT 1'
+    );
+    if (rows[0] && Number(rows[0].oxr_timestamp) >= oxrTs) return;
+
+    await pool.query(
+      `INSERT INTO fx_rates (base, rates, oxr_timestamp, source)
+       VALUES ($1, $2, $3, 'oxr')`,
+      [base || 'USD', rates, oxrTs]
+    );
+    if (VERBOSE) console.log(`[fx-poll] stored rates @ ${new Date(oxrTs * 1000).toISOString()}`);
+  } catch (err) {
+    console.warn('[fx-poll]', err.message);
+  }
+}
+
+// Read the latest cached rates (fallback to fresh OXR if DB empty)
+async function getCachedRates() {
+  const { rows } = await pool.query(
+    'SELECT base, rates, oxr_timestamp, ts FROM fx_rates ORDER BY id DESC LIMIT 1'
+  );
+  if (rows[0]) return rows[0];
+
+  // Empty DB — poll once synchronously to populate
+  await pollAndStoreRates();
+  const retry = await pool.query(
+    'SELECT base, rates, oxr_timestamp, ts FROM fx_rates ORDER BY id DESC LIMIT 1'
+  );
+  return retry.rows[0] || null;
+}
+
+// Convert cached rates into a specific pair
+function pairFromCache(cachedRow, from, to) {
+  if (!cachedRow?.rates) return null;
+  const r = cachedRow.rates;
+  if (from === 'USD') return r[to] || null;
+  if (to === 'USD') return r[from] ? 1 / r[from] : null;
+  const fromR = r[from], toR = r[to];
+  return fromR && toR ? toR / fromR : null;
+}
+
+// Capture the day's "close" — run once per UK weekday at 22:00
+async function captureDailyClose() {
+  const uk = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+  const tradingDay = uk.toISOString().slice(0, 10); // YYYY-MM-DD
+
+  const cached = await getCachedRates();
+  if (!cached) {
+    console.warn('[fx-close] no rates to snapshot');
+    return;
+  }
+
+  await pool.query(
+    `INSERT INTO fx_daily_close (trading_day, base, rates)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (trading_day, base) DO UPDATE SET
+       rates = EXCLUDED.rates,
+       captured_at = NOW()`,
+    [tradingDay, cached.base, cached.rates]
+  );
+  console.log(`[fx-close] snapshot for ${tradingDay}`);
+}
+
+// Get most recent daily close (strictly before today)
+async function getPreviousDailyClose() {
+  const uk = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+  const today = uk.toISOString().slice(0, 10);
+  const { rows } = await pool.query(
+    `SELECT trading_day, base, rates
+       FROM fx_daily_close
+      WHERE trading_day < $1
+      ORDER BY trading_day DESC
+      LIMIT 1`,
+    [today]
+  );
+  return rows[0] || null;
+}
 
 // Rate fetching service using OpenExchangeRates API
 class RateService {
@@ -196,63 +325,32 @@ class RateService {
   
   async getRate(fromCurrency, toCurrency) {
     try {
-      // OpenExchangeRates uses USD as base currency
+      const cached = await getCachedRates();
+      if (cached) {
+        const r = pairFromCache(cached, fromCurrency, toCurrency);
+        if (r !== null) return r;
+      }
+      // Cache miss or conversion failed — fall back to live (should be rare)
       const response = await axios.get(`${this.baseURL}?app_id=${this.apiKey}`);
       const rates = response.data.rates;
-      
-      if (fromCurrency === 'USD') {
-        return rates[toCurrency] || null;
-      } else if (toCurrency === 'USD') {
-        return 1 / (rates[fromCurrency] || 1);
-      } else {
-        // For non-USD pairs, convert through USD
-        const fromRate = rates[fromCurrency];
-        const toRate = rates[toCurrency];
-        
-        if (!fromRate || !toRate) {
-          console.error(`Rate not found for ${fromCurrency} or ${toCurrency}`);
-          return null;
-        }
-        
-        return toRate / fromRate;
-      }
+      if (fromCurrency === 'USD') return rates[toCurrency] || null;
+      if (toCurrency === 'USD') return 1 / (rates[fromCurrency] || 1);
+      const fromRate = rates[fromCurrency], toRate = rates[toCurrency];
+      return (fromRate && toRate) ? toRate / fromRate : null;
     } catch (error) {
-      console.error(`Error fetching rate for ${fromCurrency}/${toCurrency}:`, error);
-      if (error.response?.status === 401) {
-        console.error('OpenExchangeRates API key invalid or missing');
-      } else if (error.response?.status === 429) {
-        console.error('OpenExchangeRates API rate limit exceeded');
-      }
+      console.error(`Error fetching rate for ${fromCurrency}/${toCurrency}:`, error.message);
       return null;
     }
   }
   
-  // Optional: Get multiple rates in one call for efficiency
   async getRates(currencyPairs) {
-    try {
-      const response = await axios.get(`${this.baseURL}?app_id=${this.apiKey}`);
-      const rates = response.data.rates;
-      const results = {};
-      
-      for (const pair of currencyPairs) {
-        const { from, to } = pair;
-        
-        if (from === 'USD') {
-          results[`${from}${to}`] = rates[to] || null;
-        } else if (to === 'USD') {
-          results[`${from}${to}`] = 1 / (rates[from] || 1);
-        } else {
-          const fromRate = rates[from];
-          const toRate = rates[to];
-          results[`${from}${to}`] = (fromRate && toRate) ? toRate / fromRate : null;
-        }
-      }
-      
-      return results;
-    } catch (error) {
-      console.error('Error fetching multiple rates:', error);
-      return {};
+    const cached = await getCachedRates();
+    if (!cached) return {};
+    const results = {};
+    for (const { from, to } of currencyPairs) {
+      results[`${from}${to}`] = pairFromCache(cached, from, to);
     }
+    return results;
   }
 }
 
@@ -568,6 +666,52 @@ const rateService = new RateService();
 const whatsappService = new WhatsAppService();
 const pipelineService = new PipelineService();
 const pipeDriveService = new PipeDriveService();
+
+// CORS for marketing site ticker
+app.use('/public', (req, res, next) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET');
+  next();
+});
+
+// Ticker rates with prev-day-close change %
+app.get('/public/ticker-rates', async (req, res) => {
+  try {
+    const [cached, prevClose] = await Promise.all([
+      getCachedRates(),
+      getPreviousDailyClose(),
+    ]);
+    if (!cached) return res.status(503).json({ error: 'no rates available' });
+
+    const pairsToShow = [
+      ['GBP', 'EUR'], ['GBP', 'USD'], ['EUR', 'USD'], ['GBP', 'CAD'],
+      ['GBP', 'SAR'], ['EUR', 'SAR'], ['GBP', 'AED'], ['EUR', 'AED'],
+    ];
+
+    const result = pairsToShow.map(([from, to]) => {
+      const current = pairFromCache(cached, from, to);
+      const prev = prevClose ? pairFromCache(prevClose, from, to) : null;
+      const changePct = (current && prev) ? ((current - prev) / prev) * 100 : null;
+      const pegged = (to === 'SAR' || to === 'AED') && from === 'USD';
+      return {
+        pair: `${from}/${to}`,
+        rate: current ? Number(current.toFixed(4)) : null,
+        change_pct: changePct !== null ? Number(changePct.toFixed(2)) : null,
+        pegged,
+      };
+    });
+
+    res.set('Cache-Control', 'public, max-age=30');
+    res.json({
+      timestamp: Number(cached.oxr_timestamp),
+      as_of: cached.ts,
+      pairs: result,
+    });
+  } catch (err) {
+    console.error('[ticker-rates]', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
 
 // Get current rate for a currency pair
 app.get('/api/rate/:from/:to', async (req, res) => {
@@ -2564,16 +2708,25 @@ async function checkRatesAndReschedule() {
 
 // Initialize and start server
 async function start() {
-  await initializeDatabase();   // make sure tables/columns/indexes exist
-  scheduleNextCheck();          // now it's safe to start the cron logic
+  await initializeDatabase();
+  scheduleNextCheck();
+
   cron.schedule('30 7 * * 1-5', () => {
     resetChannelOpenRates();
   }, { timezone: 'Europe/London' });
+
   cron.schedule('*/15 * * * 1-5', () => {
     checkChannelPairRates();
   }, { timezone: 'Europe/London' });
-  // (optional) run one immediate check:
-  // await checkRates();
+
+  // NEW: FX rate polling — runs every POLL_INTERVAL_MS
+  setInterval(pollAndStoreRates, POLL_INTERVAL_MS);
+  pollAndStoreRates(); // kick off immediately on boot
+
+  // NEW: Daily close snapshot — Mon-Fri at 22:00 UK (market close)
+  cron.schedule('0 22 * * 1-5', () => {
+    captureDailyClose();
+  }, { timezone: 'Europe/London' });
 
   const port = process.env.PORT || 3000;
   app.listen(port, () => {
