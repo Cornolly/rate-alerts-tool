@@ -711,6 +711,67 @@ app.get('/public/ticker-rates', async (req, res) => {
   }
 });
 
+app.get('/public/historical/:from/:to', async (req, res) => {
+  try {
+    const from = req.params.from.toUpperCase();
+    const to = req.params.to.toUpperCase();
+    const days = Math.min(Number(req.query.days) || 30, 1825); // cap at 5 years
+
+    // Only serve data for pairs the site actually quotes
+    const allowedPairs = new Set([
+      'GBP/EUR', 'GBP/USD', 'EUR/USD', 'GBP/CAD',
+      'GBP/SAR', 'EUR/SAR', 'GBP/AED', 'EUR/AED',
+    ]);
+    if (!allowedPairs.has(`${from}/${to}`)) {
+      return res.status(400).json({ error: 'pair not supported' });
+    }
+
+    // Fetch last N daily closes from the snapshot table
+    const { rows } = await pool.query(
+      `SELECT trading_day, base, rates
+         FROM fx_daily_close
+        WHERE trading_day > CURRENT_DATE - INTERVAL '1 day' * $1
+        ORDER BY trading_day ASC`,
+      [days]
+    );
+
+    const series = rows
+      .map((row) => {
+        const rate = pairFromCache(row, from, to);
+        return rate !== null
+          ? { date: row.trading_day, rate: Number(rate.toFixed(6)) }
+          : null;
+      })
+      .filter(Boolean);
+
+    // Summary stats — computed server-side so the browser doesn't have to
+    const rates = series.map((p) => p.rate);
+    const stats = rates.length ? {
+      high: Number(Math.max(...rates).toFixed(6)),
+      low: Number(Math.min(...rates).toFixed(6)),
+      avg: Number((rates.reduce((a, b) => a + b, 0) / rates.length).toFixed(6)),
+      start: rates[0],
+      end: rates[rates.length - 1],
+      change_pct: rates.length >= 2
+        ? Number((((rates[rates.length - 1] - rates[0]) / rates[0]) * 100).toFixed(2))
+        : null,
+    } : null;
+
+    // Cache 1 hour — daily closes never change once captured
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.json({
+      pair: `${from}/${to}`,
+      days,
+      points: series.length,
+      stats,
+      series,
+    });
+  } catch (err) {
+    console.error('[historical]', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
 // Get current rate for a currency pair
 app.get('/api/rate/:from/:to', async (req, res) => {
   try {
