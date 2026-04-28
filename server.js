@@ -711,6 +711,40 @@ app.get('/public/ticker-rates', async (req, res) => {
   }
 });
 
+// Spot rate for any allowlisted pair — used by individual pair pages
+app.get('/public/spot/:from/:to', async (req, res) => {
+  try {
+    const from = req.params.from.toUpperCase();
+    const to = req.params.to.toUpperCase();
+
+    if (!allowedPairs.has(`${from}/${to}`)) {
+      return res.status(400).json({ error: 'pair not supported' });
+    }
+
+    const [cached, prevClose] = await Promise.all([
+      getCachedRates(),
+      getPreviousDailyClose(),
+    ]);
+    if (!cached) return res.status(503).json({ error: 'no rates available' });
+
+    const current = pairFromCache(cached, from, to);
+    const prev = prevClose ? pairFromCache(prevClose, from, to) : null;
+    const changePct = (current && prev) ? ((current - prev) / prev) * 100 : null;
+
+    res.set('Cache-Control', 'public, max-age=30');
+    res.json({
+      pair: `${from}/${to}`,
+      rate: current ? Number(current.toFixed(6)) : null,
+      change_pct: changePct !== null ? Number(changePct.toFixed(2)) : null,
+      timestamp: Number(cached.oxr_timestamp),
+      as_of: cached.ts,
+    });
+  } catch (err) {
+    console.error('[spot]', err);
+    res.status(500).json({ error: 'internal error' });
+  }
+});
+
 app.get('/public/historical/:from/:to', async (req, res) => {
   try {
     const from = req.params.from.toUpperCase();
