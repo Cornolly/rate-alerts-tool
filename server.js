@@ -347,7 +347,7 @@ const allowedPairs = new Set([
   'USD/NOK', 'USD/NZD', 'USD/OMR', 'USD/PKR', 'USD/PLN', 'USD/QAR',
   'USD/RON', 'USD/SAR', 'USD/SEK', 'USD/SGD', 'USD/THB', 'USD/TRY',
   'USD/UGX', 'USD/ZAR', 'ZAR/AUD', 'ZAR/CAD', 'ZAR/CHF', 'ZAR/EUR',
-  'ZAR/GBP', 'ZAR/NZD', 'ZAR/USD', 'SAR/CAD',
+  'ZAR/GBP', 'ZAR/NZD', 'ZAR/USD', 'SAR/CAD', 'SAR/ZAR',
 ]);
 
 async function captureDailyClose() {
